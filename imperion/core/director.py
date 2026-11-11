@@ -1,33 +1,39 @@
-"""The Director ("müdür"): runs the agent team, matches playbooks and decides LONG / SHORT / NO TRADE.
 
-Decision chain (every step is logged as a reason, nothing is hidden in a single score):
-  1. price-action maps of the setup and trigger timeframes, 8-timeframe view, market regime
-  2. every agent reports (trend, structure, liquidity, zones, trigger, order flow, microstructure, momentum,
-     market context, derivatives, external hint)
-  3. playbooks: complete setup models (sweep reversal, trend pullback, breakout retest, range fade)
-  4. for each playbook, best first:
-       completeness  >= threshold (regime dependent)
-       higher-timeframe trend not strongly against it (sweep reversals that are complete enough are exempt)
-       no agent veto (momentum exhaustion, imminent adverse funding, ...)
-       an executable plan exists (stop, liquidity targets, room, costs)
-       the team agrees: weighted net, number of agreeing agents, opposition, price-action agreement
-       quality grade B or better
-  5. the first playbook that passes everything is the decision.
-The Director never sees the account and never places orders; risk, AI vetoes and execution belong to the runtime.
+"""IMPERION FINANCE AI V17 - Advanced Decision Director.
+
+Coordinates market analysis, agents, playbooks, consensus and
+trade planning.
+
+Decision pipeline:
+    PERCEIVE -> UNDERSTAND -> DECIDE -> PROTECT
+
+The Director does not place orders or access account balances.
+An approved analysis is still subject to runtime risk guards,
+portfolio limits and execution checks.
+
+Public compatibility:
+    Director(...)
+    Director.analyze(...)
+    director.params
+    director.threshold_overrides
+    director.weights_provider
 """
 from __future__ import annotations
 
-from typing import Callable, Dict, Optional, Sequence, Tuple
 import inspect
+import math
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
 from ..agents import AgentContext, default_team
 from ..analysis import market
 from ..analysis.mtf import alignment, mtf_view
 from ..analysis.priceaction import build_map, summary
-from ..analysis.priceaction.smt import smt_divergence
 from ..analysis.priceaction.confluence import adaptive_thresholds
-from ..analysis.priceaction.market_models import detect_mmbm_candidate
+from ..analysis.priceaction.market_models import (
+    detect_mmbm_candidate,
+)
 from ..analysis.priceaction.playbooks import find_playbooks
+from ..analysis.priceaction.smt import smt_divergence
 from ..config import STYLES, TIMEFRAMES, Settings
 from ..models import DIR_OF, NEUTRAL, Analysis
 from ..util import now_ms
@@ -35,121 +41,639 @@ from .consensus import consensus
 from .planner import build_plan, grade, quality
 from .policy import effective_weights, profile
 
-WeightsProvider = Callable[[], Tuple[int, Dict[str, float]]]
+
+WeightsProvider = Callable[
+    [], Tuple[int, Dict[str, float]]
+]
+
+
+SMT_PAIRS = {
+    "BTCUSDT": "ETHUSDT",
+    "ETHUSDT": "BTCUSDT",
+    "SOLUSDT": "ETHUSDT",
+    "BNBUSDT": "ETHUSDT",
+    "XRPUSDT": "BTCUSDT",
+    "ADAUSDT": "BTCUSDT",
+}
+
+
+def _finite(value) -> bool:
+    """Accept finite numeric values, excluding booleans."""
+    if isinstance(value, bool):
+        return False
+
+    if not isinstance(value, (int, float)):
+        return False
+
+    try:
+        return math.isfinite(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _positive(value) -> bool:
+    return _finite(value) and value > 0
+
+
+def _health(value) -> float:
+    """Normalize market-data health to a safe 0..1 score."""
+    if not _finite(value):
+        return 0.0
+
+    return max(0.0, min(1.0, float(value)))
+
+
+def _usable_price(value):
+    """Return a valid market price or None."""
+    return value if _positive(value) else None
 
 
 class Director:
-    def __init__(self, cfg: Settings, candles, trades, books, deriv, weights_provider: Optional[WeightsProvider] = None,
-                 agents: Optional[Sequence] = None, threshold_overrides: Optional[Dict[str, float]] = None):
-        self.cfg, self.candles, self.trades, self.books, self.deriv = cfg, candles, trades, books, deriv
-        self.threshold_overrides = dict(threshold_overrides or {})
-        self.params = None          # optional ParameterSet injected for research / optimization
-        self.agents = list(agents) if agents is not None else default_team()
-        self.weights_provider = weights_provider or (lambda: (0, {}))
+    """Orchestrates analysis without performing execution."""
 
-    def analyze(self, symbol: str, style_name: str, hint: Optional[str] = None, now: Optional[int] = None,
-                data_ok: bool = True, health_quality: float = 1.0) -> Analysis:
+    def __init__(
+        self,
+        cfg: Settings,
+        candles,
+        trades,
+        books,
+        deriv,
+        weights_provider: Optional[WeightsProvider] = None,
+        agents: Optional[Sequence] = None,
+        threshold_overrides: Optional[Dict[str, float]] = None,
+    ):
+        self.cfg = cfg
+        self.candles = candles
+        self.trades = trades
+        self.books = books
+        self.deriv = deriv
+
+        self.threshold_overrides = dict(
+            threshold_overrides or {}
+        )
+
+        # Research/optimization ParameterSet injection point.
+        self.params = None
+
+        self.agents = (
+            list(agents)
+            if agents is not None
+            else default_team()
+        )
+
+        self.weights_provider = (
+            weights_provider
+            if weights_provider is not None
+            else lambda: (0, {})
+        )
+
+    def _market_intelligence(
+        self,
+        symbol,
+        style,
+        now,
+        setup_cs,
+        smap,
+        reg,
+    ):
+        """Collect optional market intelligence.
+
+        Optional feed failures are recorded as unavailable;
+        they never become positive evidence.
+        """
+        smt = None
+
+        comparison_symbol = SMT_PAIRS.get(
+            symbol.upper()
+        )
+
+        if (
+            comparison_symbol
+            and comparison_symbol in self.cfg.symbols
+        ):
+            try:
+                comparison_cs = self.candles.get(
+                    comparison_symbol,
+                    style.setup_tf,
+                )
+
+                if comparison_cs:
+                    smt = smt_divergence(
+                        setup_cs,
+                        comparison_cs,
+                    )
+
+                    if isinstance(smt, dict):
+                        smt["comparison_symbol"] = (
+                            comparison_symbol
+                        )
+                        smt["primary_symbol"] = (
+                            symbol.upper()
+                        )
+                    else:
+                        smt = None
+
+            except Exception:
+                smt = {
+                    "available": False,
+                    "reason": "smt_data_error",
+                }
+
+        flow = None
+
+        if (
+            self.trades is not None
+            and hasattr(self.trades, "flow_profile")
+        ):
+            try:
+                flow = self.trades.flow_profile(
+                    symbol,
+                    minutes=5,
+                    now=now,
+                )
+
+            except Exception:
+                flow = {
+                    "available": False,
+                    "reason": "flow_profile_error",
+                }
+
+        try:
+            market_model = detect_mmbm_candidate(
+                setup_cs,
+                smap.atr,
+            )
+
+        except Exception:
+            market_model = {
+                "available": False,
+                "reason": "market_model_error",
+            }
+
+        thresholds = adaptive_thresholds(
+            reg.get("volatility")
+            or reg.get("regime")
+            or "NORMAL"
+        )
+
+        intelligence = {
+            "smt": smt,
+            "flow": flow,
+            "market_model": market_model,
+            "thresholds": thresholds,
+        }
+
+        details = {
+            "smt": smt,
+            "structure": {
+                "internal": (
+                    smap.structure.internal_trend
+                ),
+                "external": (
+                    smap.structure.external_trend
+                ),
+            },
+            "displacement_quality": (
+                smap.displacement_quality
+            ),
+            "displacement_facts": (
+                smap.displacement_facts
+            ),
+            "flow_divergence": (
+                smap.flow_divergence
+            ),
+            "flow": flow,
+            "market_model": market_model,
+            "adaptive_thresholds": thresholds,
+        }
+
+        return intelligence, details
+
+    def _find_playbooks(
+        self,
+        smap,
+        tmap,
+        htf,
+        regime_name,
+        intelligence,
+    ):
+        """Preserve compatibility with older playbook adapters."""
+        args = (
+            smap,
+            tmap,
+            htf,
+            regime_name,
+            self.params,
+        )
+
+        try:
+            parameters = inspect.signature(
+                find_playbooks
+            ).parameters
+
+        except (TypeError, ValueError):
+            parameters = {}
+
+        if "intelligence" in parameters:
+            return find_playbooks(
+                *args,
+                intelligence=intelligence,
+            )
+
+        return find_playbooks(*args)
+
+    def analyze(
+        self,
+        symbol: str,
+        style_name: str,
+        hint: Optional[str] = None,
+        now: Optional[int] = None,
+        data_ok: bool = True,
+        health_quality: float = 1.0,
+    ) -> Analysis:
+        """Return an approved trade or a NO TRADE analysis."""
         style = STYLES[style_name]
         now = now if now is not None else now_ms()
-        setup_cs = self.candles.get(symbol, style.setup_tf)
-        trig_cs = self.candles.get(symbol, style.trigger_tf)
-        smap, tmap = build_map(setup_cs), build_map(trig_cs)
-        mtf = mtf_view(self.candles, symbol, TIMEFRAMES)
-        reg = market.regime(setup_cs, smap.structure.trend if smap.ok else None)
+
+        setup_cs = self.candles.get(
+            symbol,
+            style.setup_tf,
+        )
+
+        trig_cs = self.candles.get(
+            symbol,
+            style.trigger_tf,
+        )
+
+        smap = build_map(setup_cs)
+        tmap = build_map(trig_cs)
+
+        mtf = mtf_view(
+            self.candles,
+            symbol,
+            TIMEFRAMES,
+        )
+
+        reg = market.regime(
+            setup_cs,
+            smap.structure.trend if smap.ok else None,
+        )
+
         reg["session"] = market.session(now)
-        ctx = AgentContext(symbol, style, now, self.cfg, self.candles, self.trades, self.books, self.deriv, tuple(self.cfg.symbols),
-                           setup_cs, trig_cs, smap, tmap, reg, mtf, hint)
-        reports = {a.name: a.run(ctx) for a in self.agents}
-        live = self.trades.last_price(symbol) if self.trades is not None else None
-        price = live or (trig_cs[-1].c if trig_cs else None) or (smap.price if smap.ok else None)
-        an = Analysis(symbol, style_name, now, price=price, reports=reports, regime=reg, mtf=mtf,
-                      maps={"setup": summary(smap), "trigger": summary(tmap)}, data_ok=data_ok)
+
+        ctx = AgentContext(
+            symbol,
+            style,
+            now,
+            self.cfg,
+            self.candles,
+            self.trades,
+            self.books,
+            self.deriv,
+            tuple(self.cfg.symbols),
+            setup_cs,
+            trig_cs,
+            smap,
+            tmap,
+            reg,
+            mtf,
+            hint,
+        )
+
+        reports = {
+            agent.name: agent.run(ctx)
+            for agent in self.agents
+        }
+
+        live = None
+
+        if self.trades is not None:
+            try:
+                live = _usable_price(
+                    self.trades.last_price(symbol)
+                )
+            except Exception:
+                live = None
+
+        trigger_price = None
+
+        if trig_cs:
+            trigger_price = _usable_price(
+                trig_cs[-1].c
+            )
+
+        map_price = (
+            _usable_price(smap.price)
+            if smap.ok
+            else None
+        )
+
+        price = (
+            live
+            if live is not None
+            else trigger_price
+            if trigger_price is not None
+            else map_price
+        )
+
+        an = Analysis(
+            symbol,
+            style_name,
+            now,
+            price=price,
+            reports=reports,
+            regime=reg,
+            mtf=mtf,
+            maps={
+                "setup": summary(smap),
+                "trigger": summary(tmap),
+            },
+            data_ok=data_ok,
+        )
+
+        # Default state is always NO TRADE.
+        an.approved = False
+        an.direction = None
+
         wver, learned = self.weights_provider()
-        prof = profile(reg.get("regime"), reg.get("volatility"), self.cfg.regime_adaptive, self.threshold_overrides)
-        weights, th = effective_weights(learned, prof), prof["thresholds"]
+
+        prof = profile(
+            reg.get("regime"),
+            reg.get("volatility"),
+            self.cfg.regime_adaptive,
+            self.threshold_overrides,
+        )
+
+        weights = effective_weights(
+            learned,
+            prof,
+        )
+
+        thresholds = prof["thresholds"]
+
         an.weights_version = wver
         an.regime["profile"] = prof["name"]
-        an.consensus = {side: consensus(reports, weights, DIR_OF[side], th) for side in ("LONG", "SHORT")}
-        if not smap.ok:
-            an.reasons = [f"SETUP_MAP_UNAVAILABLE ({smap.reason})"]
-            return an
-        trend = reports.get("trend")
-        htf = {"direction": trend.direction, "strength": trend.confidence} if trend is not None and trend.available else None
-        # Inter-market SMT: use only explicitly paired, same-timeframe series.
-        pairs = {"BTCUSDT": "ETHUSDT", "ETHUSDT": "BTCUSDT", "SOLUSDT": "ETHUSDT",
-                 "BNBUSDT": "ETHUSDT", "XRPUSDT": "BTCUSDT", "ADAUSDT": "BTCUSDT"}
-        comparison_symbol = pairs.get(symbol.upper())
-        smt = None
-        if comparison_symbol and comparison_symbol in self.cfg.symbols:
-            comparison_cs = self.candles.get(comparison_symbol, style.setup_tf)
-            if comparison_cs:
-                smt = smt_divergence(setup_cs, comparison_cs)
-                smt["comparison_symbol"] = comparison_symbol
-                smt["primary_symbol"] = symbol.upper()
-        flow = None
-        if self.trades is not None and hasattr(self.trades, "flow_profile"):
-            try:
-                flow = self.trades.flow_profile(symbol, minutes=5, now=now)
-            except Exception:
-                flow = {"available": False, "reason": "flow_profile_error"}
-        market_model = detect_mmbm_candidate(setup_cs, smap.atr) if smap.ok else {"available": False}
-        thresholds = adaptive_thresholds(reg.get("volatility") or reg.get("regime") or "NORMAL")
-        intelligence = {"smt": smt, "flow": flow, "market_model": market_model, "thresholds": thresholds}
-        an.regime["market_intelligence"] = {
-            "smt": smt,
-            "structure": {"internal": smap.structure.internal_trend, "external": smap.structure.external_trend},
-            "displacement_quality": smap.displacement_quality,
-            "displacement_facts": smap.displacement_facts, "flow_divergence": smap.flow_divergence,
-            "flow": flow, "market_model": market_model, "adaptive_thresholds": thresholds,
+
+        an.consensus = {
+            side: consensus(
+                reports,
+                weights,
+                DIR_OF[side],
+                thresholds,
+            )
+            for side in ("LONG", "SHORT")
         }
-        # Keep the Director seam compatible with test doubles / downstream adapters
-        # that still expose the V15 five-argument playbook callable.
-        if "intelligence" in inspect.signature(find_playbooks).parameters:
-            an.playbooks = find_playbooks(smap, tmap, htf, reg.get("regime") or "UNKNOWN", self.params,
-                                          intelligence=intelligence)
-        else:
-            an.playbooks = find_playbooks(smap, tmap, htf, reg.get("regime") or "UNKNOWN", self.params)
-        if not an.playbooks:
-            an.reasons = ["NO_PLAYBOOK (no complete price-action setup)"]
+
+        if not smap.ok:
+            an.reasons = [
+                "SETUP_MAP_UNAVAILABLE "
+                f"({smap.reason})"
+            ]
             return an
+
+        if price is None:
+            an.reasons = [
+                "NO_VALID_MARKET_PRICE"
+            ]
+            return an
+
+        trend = reports.get("trend")
+        htf = None
+
+        if (
+            trend is not None
+            and trend.available
+            and _finite(trend.confidence)
+        ):
+            htf = {
+                "direction": trend.direction,
+                "strength": max(
+                    0.0,
+                    min(1.0, trend.confidence),
+                ),
+            }
+
+        intelligence, details = (
+            self._market_intelligence(
+                symbol,
+                style,
+                now,
+                setup_cs,
+                smap,
+                reg,
+            )
+        )
+
+        an.regime["market_intelligence"] = details
+
+        an.playbooks = self._find_playbooks(
+            smap,
+            tmap,
+            htf,
+            reg.get("regime") or "UNKNOWN",
+            intelligence,
+        )
+
+        if not an.playbooks:
+            an.reasons = [
+                "NO_PLAYBOOK "
+                "(no complete price-action setup)"
+            ]
+            return an
+
         rejected = []
+
         for pb in an.playbooks:
             tag = f"{pb.name}/{pb.side}"
-            d = DIR_OF[pb.side]
-            if pb.score < th["min_playbook"]:
-                rejected.append(f"{tag}: PLAYBOOK_INCOMPLETE ({pb.score:.2f} < {th['min_playbook']:.2f})")
+
+            if pb.side not in ("LONG", "SHORT"):
+                rejected.append(
+                    f"{tag}: INVALID_PLAYBOOK_SIDE"
+                )
                 continue
-            if (htf and htf["direction"] not in (d, NEUTRAL) and htf["strength"] >= th["htf_veto"]
-                    and not (pb.name == "sweep_reversal" and pb.score >= th["htf_veto_exempt"])):
-                rejected.append(f"{tag}: HTF_TREND_AGAINST (strength {htf['strength']:.2f})")
+
+            if (
+                not _finite(pb.score)
+                or not 0 <= pb.score <= 1
+            ):
+                rejected.append(
+                    f"{tag}: INVALID_PLAYBOOK_SCORE"
+                )
                 continue
-            vetoes = [r.veto[pb.side] for r in reports.values() if r.available and pb.side in r.veto]
+
+            direction = DIR_OF[pb.side]
+
+            minimum_score = thresholds["min_playbook"]
+
+            if pb.score < minimum_score:
+                rejected.append(
+                    f"{tag}: PLAYBOOK_INCOMPLETE "
+                    f"({pb.score:.2f} < "
+                    f"{minimum_score:.2f})"
+                )
+                continue
+
+            htf_against = (
+                htf is not None
+                and htf["direction"] not in (
+                    direction,
+                    NEUTRAL,
+                )
+                and htf["strength"]
+                >= thresholds["htf_veto"]
+            )
+
+            reversal_exempt = (
+                pb.name == "sweep_reversal"
+                and pb.score
+                >= thresholds["htf_veto_exempt"]
+            )
+
+            if htf_against and not reversal_exempt:
+                rejected.append(
+                    f"{tag}: HTF_TREND_AGAINST "
+                    f"(strength "
+                    f"{htf['strength']:.2f})"
+                )
+                continue
+
+            vetoes = [
+                report.veto[pb.side]
+                for report in reports.values()
+                if report.available
+                and pb.side in report.veto
+            ]
+
             if vetoes:
-                rejected.append(f"{tag}: VETO " + "; ".join(vetoes))
+                rejected.append(
+                    f"{tag}: VETO "
+                    + "; ".join(vetoes)
+                )
                 continue
-            setup, why, facts = build_plan(symbol, style, pb, smap, self.cfg, price)
+
+            setup, why, facts = build_plan(
+                symbol,
+                style,
+                pb,
+                smap,
+                self.cfg,
+                price,
+            )
+
             if setup is None:
-                rejected.append(f"{tag}: " + "; ".join(why))
+                rejected.append(
+                    f"{tag}: "
+                    + "; ".join(why)
+                )
                 continue
-            c = an.consensus[pb.side]
-            q = quality(pb.score, c["net"], len(c["agree"]), alignment(mtf, d), setup.rr, style, health_quality,
-                        c["flow_confirmed"], facts.get("obstacle_before_tp2", False))
-            g = grade(q, style)
-            setup.grade = g
-            if an.setup is None:                      # best executable candidate (shadow-tracked even if rejected)
-                an.setup, an.playbook, an.quality, an.grade = setup, pb, q, g
-            if not c["passed"]:
-                rejected.append(f"{tag}: " + "; ".join(c["reasons"]))
+
+            candidate_consensus = (
+                an.consensus[pb.side]
+            )
+
+            candidate_quality = quality(
+                pb.score,
+                candidate_consensus["net"],
+                len(candidate_consensus["agree"]),
+                alignment(mtf, direction),
+                setup.rr,
+                style,
+                _health(health_quality),
+                candidate_consensus[
+                    "flow_confirmed"
+                ],
+                facts.get(
+                    "obstacle_before_tp2",
+                    False,
+                ),
+            )
+
+            candidate_grade = grade(
+                candidate_quality,
+                style,
+            )
+
+            setup.grade = candidate_grade
+
+            # Preserve the legacy shadow candidate for
+            # analysis and reporting. It is NOT approved.
+            if an.setup is None:
+                an.setup = setup
+                an.playbook = pb
+                an.quality = candidate_quality
+                an.grade = candidate_grade
+
+            if not candidate_consensus["passed"]:
+                rejected.append(
+                    f"{tag}: "
+                    + "; ".join(
+                        candidate_consensus["reasons"]
+                    )
+                )
                 continue
-            if g == "C":
-                rejected.append(f"{tag}: QUALITY_BELOW_THRESHOLD ({q:.0f} < {style.min_quality:.0f})")
+
+            if candidate_grade == "C":
+                rejected.append(
+                    f"{tag}: QUALITY_BELOW_THRESHOLD "
+                    f"({candidate_quality:.0f} < "
+                    f"{style.min_quality:.0f})"
+                )
                 continue
-            an.setup, an.playbook, an.quality, an.grade = setup, pb, q, g
+
             if not data_ok:
-                an.reasons = ["DATA_BLOCKED (market data not healthy)", f"candidate: {tag} grade {g}"]
+                an.reasons = [
+                    "DATA_BLOCKED "
+                    "(market data not healthy)",
+                    f"candidate: {tag} "
+                    f"grade {candidate_grade}",
+                ]
                 return an
-            an.direction, an.approved = pb.side, True
-            an.reasons = [f"{pb.name} {pb.side} — derece {g} (kalite {q:.0f})", "uyumlu ajanlar: " + ", ".join(c["agree"])] + pb.steps
+
+            if _health(health_quality) <= 0:
+                an.reasons = [
+                    "HEALTH_BLOCKED "
+                    "(invalid or zero market health)",
+                    f"candidate: {tag}",
+                ]
+                return an
+
+            # All Director-level checks passed.
+            # Runtime portfolio and execution guards
+            # must still independently approve.
+            an.setup = setup
+            an.playbook = pb
+            an.quality = candidate_quality
+            an.grade = candidate_grade
+            an.direction = pb.side
+            an.approved = True
+
+            an.reasons = [
+                f"{pb.name} {pb.side} — "
+                f"derece {candidate_grade} "
+                f"(kalite {candidate_quality:.0f})",
+                "uyumlu ajanlar: "
+                + ", ".join(
+                    candidate_consensus["agree"]
+                ),
+                *pb.steps,
+            ]
+
             return an
-        an.reasons = (["DATA_BLOCKED (market data not healthy)"] if not data_ok else []) + rejected[:6]
+
+        if not data_ok:
+            rejected.insert(
+                0,
+                "DATA_BLOCKED "
+                "(market data not healthy)",
+            )
+
+        an.reasons = (
+            rejected[:6]
+            if rejected
+            else ["NO_TRADE_NO_APPROVED_CANDIDATE"]
+        )
+
         return an
+
+
+# DIRECTOR_PY_END
