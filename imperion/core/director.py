@@ -391,9 +391,10 @@ class Director:
             data_ok=data_ok,
         )
 
-        # Default state is always NO TRADE.
+        # Fail-closed default:
+        # A rejected candidate is never an approved trade.
         an.approved = False
-        an.direction = None
+        an.direction = "NO TRADE"
 
         wver, learned = self.weights_provider()
 
@@ -595,8 +596,8 @@ class Director:
 
             setup.grade = candidate_grade
 
-            # Preserve the legacy shadow candidate for
-            # analysis and reporting. It is NOT approved.
+            # Shadow candidate for analysis only.
+            # Never treat it as execution approval.
             if an.setup is None:
                 an.setup = setup
                 an.playbook = pb
@@ -637,9 +638,9 @@ class Director:
                 ]
                 return an
 
-            # All Director-level checks passed.
-            # Runtime portfolio and execution guards
-            # must still independently approve.
+            # Director-level approval only.
+            # Runtime risk and execution guards
+            # remain mandatory.
             an.setup = setup
             an.playbook = pb
             an.quality = candidate_quality
