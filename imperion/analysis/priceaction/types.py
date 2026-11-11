@@ -1,108 +1,171 @@
-"""Value types of the price-action map. Everything here is plain data: the engines never keep hidden state."""
+
+"""IMPERION FINANCE AI V17 - Price Action Data Models.
+
+Backward-compatible data contracts for structure, liquidity, zones,
+sessions, order flow and executable playbooks.
+
+Existing positional constructor arguments and legacy fields are preserved.
+New fields are appended with defaults to avoid breaking V17 consumers.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from ...models import NEUTRAL
+
+LIQUIDITY_STATES = (
+    "FRESH",
+    "TESTED",
+    "SWEPT",
+    "INVALIDATED",
+)
+
+LIQUIDITY_SIDES = ("BUY_SIDE", "SELL_SIDE")
 
 
 @dataclass(frozen=True)
 class Swing:
-    i: int          # candle index
-    t: int          # candle open time (ms)
+    i: int
+    t: int
     price: float
-    kind: str       # "H" | "L"
+    kind: str  # H | L
+
+    @property
+    def confirmation_index(self) -> int:
+        """Default major swing confirmation width."""
+        return self.i + 3
 
 
 @dataclass
 class Break:
-    """A candle CLOSE through an unbroken swing: BOS continues the trend, CHOCH is the first break against it."""
-    kind: str               # "BOS" | "CHOCH"
-    direction: str          # "UP" | "DOWN"
+    kind: str
+    direction: str
     level: float
     index: int
-    displacement: float     # body of the breaking candle in ATR multiples
-    major: bool = False     # took out the most extreme swing of the recent window
-    age: int = 0            # candles since the break
+    displacement: float
+    major: bool = False
+    age: int = 0
+
+    # Extended evidence; not required by legacy constructors.
+    confirmed_close: bool = True
+    body_ratio: float = 0.0
+    swept_liquidity: bool = False
 
 
 @dataclass
 class Structure:
-    trend: str = "UNKNOWN"                  # UP | DOWN | RANGE | UNKNOWN
+    trend: str = "UNKNOWN"
     last_break: Optional[Break] = None
     breaks: List[Break] = field(default_factory=list)
-    ref_high: Optional[Swing] = None        # unbroken swing high: a close above it is the next break up
+    ref_high: Optional[Swing] = None
     ref_low: Optional[Swing] = None
-    last_high: Optional[Swing] = None       # most recent confirmed swings (targets / obstacles)
+    last_high: Optional[Swing] = None
     last_low: Optional[Swing] = None
-    protected: Optional[float] = None       # origin of the last break: losing it invalidates the trend
+    protected: Optional[float] = None
     protected_i: Optional[int] = None
-    swing_bias: str = "MIXED"               # HH_HL | LH_LL | MIXED
-    # Advanced
-    internal_trend: str = "UNKNOWN"         # nested / internal structure bias
+    swing_bias: str = "MIXED"
+
+    internal_trend: str = "UNKNOWN"
     external_trend: str = "UNKNOWN"
     internal_last_break_kind: Optional[str] = None
     internal_last_break_direction: Optional[str] = None
     internal_last_break_age: Optional[int] = None
+
+    # Explicit conflict and structural invalidation metadata.
+    htf_conflict: bool = False
+    htf_policy: str = "VETO"
+    invalidated: bool = False
+    invalidation_reason: str = ""
 
 
 @dataclass
 class DealingRange:
     high: float
     low: float
-    position: float     # 0 = range low (deep discount), 1 = range high (deep premium)
-    source: str         # "leg" (impulse leg of the current trend) | "window"
-    ote_zone: bool = False                  # True if current price is in 0.62-0.79 band
-    premium_discount: str = "NEUTRAL"       # PREMIUM | DISCOUNT | NEUTRAL | OTE
+    position: float
+    source: str
+    ote_zone: bool = False
+    premium_discount: str = "NEUTRAL"
+
+    @property
+    def midpoint(self) -> float:
+        return (self.high + self.low) / 2.0
 
 
 @dataclass
 class Pool:
-    """Resting liquidity: stops above equal/old highs (buy-side) or below equal/old lows (sell-side)."""
     price: float
-    kind: str           # EQH | HIGH | PDH | EQL | LOW | PDL
+    kind: str
     touches: int
     last_i: int
+
+    # Lifecycle fields are optional for legacy liquidity producers.
+    state: str = "FRESH"
+    side: str = ""
+    last_test_i: Optional[int] = None
+    swept_i: Optional[int] = None
+    invalidated_i: Optional[int] = None
+
+    @property
+    def active(self) -> bool:
+        return self.state in ("FRESH", "TESTED")
 
 
 @dataclass
 class Sweep:
-    """A wick through a pool that was closed back: the stops were taken and price was rejected."""
-    direction: str      # BULLISH after a sell-side sweep, BEARISH after a buy-side sweep
+    direction: str
     level: float
-    extreme: float      # tip of the sweeping wick (structural invalidation of the reversal)
+    extreme: float
     index: int
     age: int
     touches: int
     kind: str
-    quality: float      # 0.5 .. 0.85
-    has_inducement: bool = False            # True if an IDM was taken before this sweep
+    quality: float
+    has_inducement: bool = False
+
+    # Additional confirmation evidence.
+    reclaimed: bool = True
+    reclaim_index: Optional[int] = None
+    external_liquidity: bool = False
 
 
 @dataclass
 class Zone:
-    kind: str                   # "OB" | "FVG" | "MITIGATION" | "BREAKER"
-    direction: str              # polarity at creation
+    kind: str
+    direction: str
     lo: float
     hi: float
     created: int
     touches: int = 0
-    fill: float = 0.0           # share of an FVG already traded into (1 = fully mitigated)
-    displacement: float = 0.0   # ATR multiple of the candle that created it
-    flipped_at: Optional[int] = None    # index of the close through the zone (OB -> breaker, FVG -> inverted FVG)
-    quality: float = 0.5                # 0..1 advanced quality score
-    mean_threshold: Optional[float] = None  # 50% of the zone (for OTE-like entries)
+    fill: float = 0.0
+    displacement: float = 0.0
+    flipped_at: Optional[int] = None
+    quality: float = 0.5
+    mean_threshold: Optional[float] = None
+
+    # Optional lifecycle and context metadata.
+    state: str = "FRESH"
+    invalidated_at: Optional[int] = None
+    source_tf: str = ""
+    htf_aligned: Optional[bool] = None
 
     @property
     def bounds(self) -> Tuple[float, float]:
         return self.lo, self.hi
 
+    @property
+    def midpoint(self) -> float:
+        return (self.lo + self.hi) / 2.0
+
+    @property
+    def active(self) -> bool:
+        return self.state != "INVALIDATED"
+
 
 @dataclass
 class Inducement:
-    """Internal liquidity (IDM) taken before a major external liquidity sweep."""
-    direction: str              # BULLISH / BEARISH
+    direction: str
     level: float
     index: int
     age: int
@@ -121,92 +184,132 @@ class Level:
     price: float
     touches: int
 
+    kind: str = ""
+    state: str = "FRESH"
+    side: str = ""
+    source_tf: str = ""
+
 
 @dataclass
 class SessionRange:
-    """Session liquidity range (Asia, London, NY) with sweep quality."""
-    name: str                   # ASIA | LONDON | NY
+    name: str
     high: float
     low: float
     start_i: int
     end_i: int
     swept: bool = False
-    sweep_dir: Optional[str] = None  # BULLISH / BEARISH if swept
-    sweep_quality: float = 0.0       # 0..1 how clean and significant the sweep was
-    range_atr: float = 0.0           # session range width in ATR
-    age_candles: int = 0             # candles since session ended
-    killzone: Optional[str] = None   # LONDON_OPEN | NY_OPEN | LONDON_NY_OVERLAP
+    sweep_dir: Optional[str] = None
+    sweep_quality: float = 0.0
+    range_atr: float = 0.0
+    age_candles: int = 0
+    killzone: Optional[str] = None
     overlap: bool = False
 
+    # Explicit session validity metadata.
+    timezone: str = "UTC"
+    complete: bool = True
 
 
 @dataclass
 class CISD:
-    """Change in State of Delivery: strong displacement that shifts delivery after liquidity or range break."""
-    direction: str              # BULLISH | BEARISH
+    direction: str
     index: int
     age: int
-    level: float                # close or extreme of the CISD candle
-    displacement: float         # ATR multiple
+    level: float
+    displacement: float
     quality: float = 0.6
     after_sweep: bool = False
     after_session: bool = False
-    follow_through: float = 0.0     # how well the next candles continued
+    follow_through: float = 0.0
     closes_beyond_structure: bool = False
-
 
 
 @dataclass
 class PAMap:
-    """Everything price action knows about one candle series, computed once and shared by engines and playbooks."""
     ok: bool
     reason: str = ""
     n: int = 0
     price: float = 0.0
     atr: float = 0.0
+
     swings: List[Swing] = field(default_factory=list)
     minor: List[Swing] = field(default_factory=list)
     structure: Structure = field(default_factory=Structure)
     range: Optional[DealingRange] = None
+
     pools_above: List[Pool] = field(default_factory=list)
     pools_below: List[Pool] = field(default_factory=list)
     sweeps: List[Sweep] = field(default_factory=list)
     external_sweeps: List[Sweep] = field(default_factory=list)
+
     zones: List[Zone] = field(default_factory=list)
     candle: CandleSignal = field(default_factory=CandleSignal)
-    displacement: Optional[Tuple[str, float]] = None     # (direction, body in ATR) of the last candle
+    displacement: Optional[Tuple[str, float]] = None
     levels: List[Level] = field(default_factory=list)
     recent_low: Optional[float] = None
     recent_high: Optional[float] = None
-    # Advanced layers
+
     inducements: List[Inducement] = field(default_factory=list)
     mitigation_zones: List[Zone] = field(default_factory=list)
     confluence_score: float = 0.0
-    # Momentum & Trend direction (explicit PA-level)
-    momentum: str = "NEUTRAL"           # BULLISH | BEARISH | NEUTRAL
-    momentum_strength: float = 0.0      # 0..1
-    trend_direction: str = "NEUTRAL"    # aligned with structure.trend but normalized
-    trend_strength: float = 0.0         # 0..1 based on recent BOS quality / age
-    # Session & CISD
+
+    momentum: str = "NEUTRAL"
+    momentum_strength: float = 0.0
+    trend_direction: str = "NEUTRAL"
+    trend_strength: float = 0.0
+
     sessions: List[SessionRange] = field(default_factory=list)
     cisds: List[CISD] = field(default_factory=list)
     displacement_quality: float = 0.0
     displacement_facts: dict = field(default_factory=dict)
     flow_divergence: dict = field(default_factory=dict)
 
+    # New advanced ecosystem outputs.
+    liquidity_inventory: List[Dict[str, Any]] = field(
+        default_factory=list
+    )
+    previous_week_high: Optional[float] = None
+    previous_week_low: Optional[float] = None
+    regime_confidence: float = 0.0
+    session_valid: Optional[bool] = None
+    news_blocked: bool = False
+    invalidation_reasons: List[str] = field(default_factory=list)
 
 
 @dataclass
 class Playbook:
-    """A complete setup model: what happened (steps), where the idea is wrong (invalidation) and where it aims."""
-    name: str                       # sweep_reversal | trend_pullback | breakout_retest | range_fade | inducement_sweep | ote_pullback | mitigation_retest
-    side: str                       # LONG | SHORT
-    score: float                    # 0 .. 1 completeness of the model
+    name: str
+    side: str
+    score: float
     steps: List[str] = field(default_factory=list)
     invalidation: float = 0.0
     target: Optional[float] = None
-    cap: Optional[float] = None     # hard ceiling for the final target (range plays)
+    cap: Optional[float] = None
+
+    # Advanced entry lifecycle.
+    trigger_model: str = ""
+    expiry_candles: Optional[int] = None
+    confirmation_source: str = ""
+    confirmation_passed: Optional[bool] = None
+    regime: str = ""
+    session: str = ""
+    invalidation_reason: str = ""
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "side": self.side, "score": round(self.score, 3), "steps": self.steps,
-                "invalidation": self.invalidation, "target": self.target, "cap": self.cap}
+        """Preserve legacy serialization and add optional evidence."""
+        return {
+            "name": self.name,
+            "side": self.side,
+            "score": round(self.score, 3),
+            "steps": self.steps,
+            "invalidation": self.invalidation,
+            "target": self.target,
+            "cap": self.cap,
+            "trigger_model": self.trigger_model,
+            "expiry_candles": self.expiry_candles,
+            "confirmation_source": self.confirmation_source,
+            "confirmation_passed": self.confirmation_passed,
+            "regime": self.regime,
+            "session": self.session,
+            "invalidation_reason": self.invalidation_reason,
+        }
