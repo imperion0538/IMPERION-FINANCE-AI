@@ -1,16 +1,21 @@
 
 """IMPERION FINANCE AI V17 - Portfolio Inventory Guard.
 
-Conservative inventory and correlated-exposure assessment.
+Protects the portfolio against excessive position counts,
+duplicate-symbol exposure, and correlated directional risk.
 
-This module does not authorize trades by itself.
-A trade must also pass RiskManager, execution and live gates.
+The execution universe is controlled by Settings and Radar,
+not by a hard-coded whitelist in this module.
+
+Inventory approval is never sufficient to authorize an order.
+RiskManager, data-quality, execution and live gates must
+independently approve every trade.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 FIXED_SYMBOLS = frozenset({
@@ -29,75 +34,85 @@ FIXED_SYMBOLS = frozenset({
     "NEOUSDT",
 })
 
-# Compatibility with existing V16.1 imports.
+# Keep BNB for compatibility with the existing
+# V16.1 correlated-major risk classification.
 MAJORS = frozenset({
     "BTCUSDT",
     "ETHUSDT",
     "SOLUSDT",
+    "BNBUSDT",
 })
 
-# Risk clusters are conservative approximations.
-# They are not claims of fixed statistical correlations.
 RISK_CLUSTERS = {
-    "LARGE_CAP": frozenset({
-        "BTCUSDT",
-        "ETHUSDT",
-        "SOLUSDT",
-    }),
+    "MAJORS": MAJORS,
     "LAYER_1": frozenset({
         "AVAXUSDT",
         "SUIUSDT",
         "DOTUSDT",
         "NEOUSDT",
     }),
-    "DEFI_INFRA": frozenset({
+    "INFRASTRUCTURE": frozenset({
         "LINKUSDT",
         "INJUSDT",
+        "FILUSDT",
     }),
-    "LEGACY": frozenset({
+    "PAYMENTS_LEGACY": frozenset({
         "XRPUSDT",
         "LTCUSDT",
         "DASHUSDT",
     }),
-    "STORAGE": frozenset({
-        "FILUSDT",
-    }),
 }
 
+MAX_EXPOSURE_MULTIPLIER = 1.0
 
-def _finite_nonnegative(value: Any) -> float:
-    """Reject invalid, non-finite and negative numeric values."""
+
+def _number(value: Any) -> float:
+    """Convert numeric input without accepting NaN or infinity."""
     if isinstance(value, bool):
-        raise ValueError("Boolean is not a valid numeric value")
+        raise ValueError("Boolean numeric input")
 
     number = float(value)
 
-    if not math.isfinite(number) or number < 0:
-        raise ValueError("Invalid nonnegative numeric value")
+    if not math.isfinite(number):
+        raise ValueError("Non-finite numeric input")
 
     return number
 
 
-def _finite_positive(value: Any) -> float:
-    number = _finite_nonnegative(value)
+def _positive(value: Any) -> float:
+    number = _number(value)
 
     if number <= 0:
-        raise ValueError("Expected a positive numeric value")
+        raise ValueError("Expected positive numeric input")
 
     return number
+
+
+def _normalize_symbol(value: Any) -> str:
+    symbol = str(value or "").strip().upper()
+
+    if (
+        not symbol
+        or not symbol.isascii()
+        or not symbol.isalnum()
+        or not symbol.endswith("USDT")
+    ):
+        raise ValueError("Invalid USDT symbol")
+
+    return symbol
 
 
 class InventoryManager:
-    """Conservative portfolio inventory risk guard.
+    """Portfolio exposure guard with a V16.1-compatible API.
 
-    Public interface remains compatible with V16.1:
+    Public methods:
         snapshot(positions)
         assess(positions, side, symbol)
 
-    Fail-closed policy:
-        Invalid exposure data blocks new entries.
-        Unsupported symbols block new entries.
-        Position limits cannot be bypassed by sizing.
+    Unknown symbols are not automatically authorized.
+    The caller must enforce the configured execution universe.
+
+    Invalid exposure quantities fail closed.
     """
 
     def __init__(
@@ -108,15 +123,21 @@ class InventoryManager:
         if isinstance(max_positions, bool):
             raise ValueError("Invalid max_positions")
 
-        self.max_positions = max(1, int(max_positions))
+        count = int(max_positions)
 
-        minimum = _finite_nonnegative(min_multiplier)
-
-        if minimum > 1:
+        if count < 1:
             raise ValueError(
-                "min_multiplier cannot exceed 1"
+                "max_positions must be positive"
             )
 
+        minimum = _number(min_multiplier)
+
+        if not 0 <= minimum <= 1:
+            raise ValueError(
+                "min_multiplier must be between 0 and 1"
+            )
+
+        self.max_positions = count
         self.min_multiplier = minimum
 
     @staticmethod
@@ -124,43 +145,25 @@ class InventoryManager:
         if not isinstance(row, dict):
             raise ValueError("Invalid position record")
 
-        qty = _finite_positive(row.get("qty"))
-        entry = _finite_positive(row.get("entry"))
+        qty = abs(_number(row.get("qty")))
+        entry = abs(_number(row.get("entry")))
+
+        if qty <= 0 or entry <= 0:
+            raise ValueError(
+                "Invalid position quantity or entry"
+            )
 
         notional = qty * entry
 
-        if not math.isfinite(notional) or notional <= 0:
-            raise ValueError("Invalid position notional")
+        if not math.isfinite(notional):
+            raise ValueError(
+                "Position notional overflow"
+            )
 
         return notional
 
     @staticmethod
-    def _normalize_position(row: dict) -> dict:
-        if not isinstance(row, dict):
-            raise ValueError("Invalid position record")
-
-        symbol = str(
-            row.get("symbol") or ""
-        ).strip().upper()
-
-        side = str(
-            row.get("side") or ""
-        ).strip().upper()
-
-        if not symbol:
-            raise ValueError("Missing position symbol")
-
-        if side not in ("LONG", "SHORT"):
-            raise ValueError("Invalid position side")
-
-        return {
-            "symbol": symbol,
-            "side": side,
-            "notional": InventoryManager._notional(row),
-        }
-
-    @staticmethod
-    def _cluster_names(symbol: str) -> List[str]:
+    def _clusters(symbol: str) -> List[str]:
         return [
             name
             for name, members in RISK_CLUSTERS.items()
@@ -168,42 +171,59 @@ class InventoryManager:
         ]
 
     def snapshot(self, positions: List[dict]) -> dict:
-        """Build a validated exposure snapshot.
+        """Return validated portfolio exposure.
 
-        Raises ValueError when positions are malformed.
-        The caller must treat such failure as a trade veto.
+        An invalid position raises ValueError.
+        The assess() method converts that into a trade veto.
         """
         if not isinstance(positions, (list, tuple)):
-            raise ValueError("Invalid positions collection")
+            raise ValueError(
+                "Invalid positions collection"
+            )
 
         long_n = 0.0
         short_n = 0.0
-
         by_symbol: Dict[str, float] = {}
-        cluster_long: Dict[str, float] = {
+
+        cluster_long = {
             name: 0.0 for name in RISK_CLUSTERS
         }
-        cluster_short: Dict[str, float] = {
+        cluster_short = {
             name: 0.0 for name in RISK_CLUSTERS
         }
 
-        normalized = []
+        symbols_present = set()
 
-        for raw in positions:
-            row = self._normalize_position(raw)
-            normalized.append(row)
+        for row in positions:
+            if not isinstance(row, dict):
+                raise ValueError(
+                    "Invalid position record"
+                )
 
-            symbol = row["symbol"]
-            side = row["side"]
-            notional = row["notional"]
+            symbol = _normalize_symbol(
+                row.get("symbol")
+            )
+            side = str(
+                row.get("side") or ""
+            ).strip().upper()
+
+            if side not in ("LONG", "SHORT"):
+                raise ValueError(
+                    "Invalid position side"
+                )
+
+            notional = self._notional(row)
+            symbols_present.add(symbol)
 
             signed = (
-                notional if side == "LONG"
+                notional
+                if side == "LONG"
                 else -notional
             )
 
             by_symbol[symbol] = (
-                by_symbol.get(symbol, 0.0) + signed
+                by_symbol.get(symbol, 0.0)
+                + signed
             )
 
             if side == "LONG":
@@ -211,7 +231,7 @@ class InventoryManager:
             else:
                 short_n += notional
 
-            for cluster in self._cluster_names(symbol):
+            for cluster in self._clusters(symbol):
                 if side == "LONG":
                     cluster_long[cluster] += notional
                 else:
@@ -220,7 +240,9 @@ class InventoryManager:
         total = long_n + short_n
 
         if not math.isfinite(total):
-            raise ValueError("Invalid total exposure")
+            raise ValueError(
+                "Invalid portfolio exposure"
+            )
 
         bias = (
             (long_n - short_n) / total
@@ -228,28 +250,27 @@ class InventoryManager:
             else 0.0
         )
 
+        major_long = sum(
+            value
+            for symbol, value in by_symbol.items()
+            if symbol in MAJORS and value > 0
+        )
+
+        major_short = sum(
+            -value
+            for symbol, value in by_symbol.items()
+            if symbol in MAJORS and value < 0
+        )
+
         return {
-            "positions": len(normalized),
+            "positions": len(positions),
             "long_notional": round(long_n, 4),
             "short_notional": round(short_n, 4),
             "net_bias": round(bias, 4),
             "symbols": by_symbol,
-            "major_long": round(
-                sum(
-                    value
-                    for symbol, value in by_symbol.items()
-                    if symbol in MAJORS and value > 0
-                ),
-                4,
-            ),
-            "major_short": round(
-                sum(
-                    -value
-                    for symbol, value in by_symbol.items()
-                    if symbol in MAJORS and value < 0
-                ),
-                4,
-            ),
+            "symbols_present": sorted(symbols_present),
+            "major_long": round(major_long, 4),
+            "major_short": round(major_short, 4),
             "cluster_long": {
                 name: round(value, 4)
                 for name, value in cluster_long.items()
@@ -260,15 +281,19 @@ class InventoryManager:
             },
         }
 
+    @staticmethod
     def _blocked(
-        self,
         reason: str,
-        snapshot: dict | None = None,
+        snapshot: Optional[dict] = None,
     ) -> dict:
         return {
             "allowed": False,
             "size_multiplier": 0.0,
-            "snapshot": snapshot or {},
+            "snapshot": (
+                snapshot
+                if snapshot is not None
+                else {}
+            ),
             "reason": reason,
         }
 
@@ -278,51 +303,47 @@ class InventoryManager:
         side: str,
         symbol: str,
     ) -> dict:
-        """Evaluate a prospective new entry.
+        """Assess a proposed new trade conservatively.
 
-        This function never increases position size.
-        A returned allowance is not final trade approval.
+        This guard can reduce or reject position size.
+        It never increases planned risk.
         """
         side = str(side or "").strip().upper()
-        symbol = str(symbol or "").strip().upper()
 
         if side not in ("LONG", "SHORT"):
             return self._blocked(
                 "INVENTORY_INVALID_SIDE"
             )
 
-        if symbol not in FIXED_SYMBOLS:
-            return self._blocked(
-                "INVENTORY_SYMBOL_NOT_ALLOWED"
-            )
-
         try:
+            symbol = _normalize_symbol(symbol)
             snap = self.snapshot(positions)
         except (ValueError, TypeError, OverflowError):
             return self._blocked(
                 "INVENTORY_INVALID_EXPOSURE_DATA"
             )
 
-        # Block entries once the position limit is reached.
-        if snap["positions"] >= self.max_positions:
+        # Duplicate-symbol risk is checked before the
+        # portfolio count so the reason remains explicit.
+        if symbol in snap["symbols_present"]:
             return self._blocked(
-                "INVENTORY_MAX_POSITIONS",
+                "SYMBOL_ALREADY_HAS_POSITION",
                 snap,
             )
 
-        # Same-symbol re-entry is blocked here as an
-        # additional layer, regardless of other guards.
-        if symbol in snap["symbols"]:
+        # A new position cannot exceed the configured
+        # concurrent-position limit.
+        if snap["positions"] >= self.max_positions:
             return self._blocked(
-                "INVENTORY_DUPLICATE_SYMBOL",
+                "INVENTORY_LIMIT "
+                "(MAX_CONCURRENT_POSITIONS)",
                 snap,
             )
 
         multiplier = 1.0
         bias = snap["net_bias"]
 
-        # Reduce risk when adding to an already
-        # directionally concentrated portfolio.
+        # Portfolio directional concentration.
         if side == "LONG" and bias > 0.35:
             multiplier *= max(
                 0.35,
@@ -335,9 +356,8 @@ class InventoryManager:
                 1.0 - (-bias - 0.35),
             )
 
-        # Additional conservative haircut when the
-        # same directional risk cluster is occupied.
-        for cluster in self._cluster_names(symbol):
+        # Correlated-cluster exposure haircut.
+        for cluster in self._clusters(symbol):
             exposure = (
                 snap["cluster_long"][cluster]
                 if side == "LONG"
@@ -347,41 +367,32 @@ class InventoryManager:
             if exposure > 0:
                 multiplier *= 0.75
 
-        # Preserve the legacy major-coin haircut.
-        if symbol in MAJORS:
-            major_exposure = (
-                snap["major_long"]
-                if side == "LONG"
-                else snap["major_short"]
-            )
-
-            if major_exposure > 0:
-                multiplier *= 0.75
-
         multiplier = round(
-            max(0.0, min(1.0, multiplier)),
+            max(
+                0.0,
+                min(
+                    MAX_EXPOSURE_MULTIPLIER,
+                    multiplier,
+                ),
+            ),
             4,
         )
 
-        allowed = (
-            multiplier > 0
-            and multiplier >= self.min_multiplier
-        )
+        if (
+            multiplier <= 0
+            or multiplier < self.min_multiplier
+        ):
+            return self._blocked(
+                "INVENTORY_LIMIT "
+                f"(size_multiplier={multiplier:.2f})",
+                snap,
+            )
 
         return {
-            "allowed": allowed,
-            "size_multiplier": (
-                multiplier if allowed else 0.0
-            ),
+            "allowed": True,
+            "size_multiplier": multiplier,
             "snapshot": snap,
-            "reason": (
-                ""
-                if allowed
-                else (
-                    "INVENTORY_LIMIT "
-                    f"(size_multiplier={multiplier:.2f})"
-                )
-            ),
+            "reason": "",
         }
 
 
