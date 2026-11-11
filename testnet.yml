@@ -1,0 +1,84 @@
+
+name: testnet
+
+# Binance USDⓈ-M Futures Demo validation that produces SIGNED live-gate evidence.
+#
+# Runs: clock, market data, signed REST, One-way position mode, both WebSockets, the bounded order lifecycle
+# (entry -> exchange-confirmed stop -> reduce-only close -> cleanup) and the exchange liquidation check (real
+# liquidationPrice vs stop and vs the bracket model). The evidence is signed with HMAC-SHA256 (TESTNET_EVIDENCE_SECRET),
+# verified again in a separate step and kept as the artifact "testnet-evidence" for 30 days (= LIVE_GATE_MAX_AGE_DAYS).
+# On the live host:  python -m imperion import-evidence testnet-evidence.json  ->  approve-live.
+#
+# Needs (repository settings):
+#   environment "testnet" with secrets BINANCE_TESTNET_API_KEY, BINANCE_TESTNET_API_SECRET
+#   secret TESTNET_EVIDENCE_SECRET (>= 32 chars; the SAME value must be set on the live host)
+#   variable TESTNET_ORDER_QTY (e.g. 0.002 for BTCUSDT), optional TESTNET_SYMBOL, TESTNET_MAX_NOTIONAL_USDT, TESTNET_RUNNER
+# Binance may refuse US-hosted GitHub runners (HTTP 451): set TESTNET_RUNNER to an EU self-hosted runner label then.
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      evidence_sha256:
+        description: SHA-256 of the signed evidence (the value a live approval is bound to)
+        value: ${{ jobs.testnet.outputs.evidence_sha256 }}
+    secrets:
+      BINANCE_TESTNET_API_KEY:
+        required: false
+      BINANCE_TESTNET_API_SECRET:
+        required: false
+      TESTNET_EVIDENCE_SECRET:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: imperion-testnet
+  cancel-in-progress: false
+
+jobs:
+  testnet:
+    name: Binance Futures Demo gate (order lifecycle + liquidation)
+    environment: testnet
+    runs-on: ${{ vars.TESTNET_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 15
+    outputs:
+      evidence_sha256: ${{ steps.verify.outputs.sha256 }}
+    env:
+      MODE: testnet
+      BINANCE_API_KEY: ${{ secrets.BINANCE_TESTNET_API_KEY }}
+      BINANCE_API_SECRET: ${{ secrets.BINANCE_TESTNET_API_SECRET }}
+      TESTNET_EVIDENCE_SECRET: ${{ secrets.TESTNET_EVIDENCE_SECRET }}
+      TESTNET_ORDER_SMOKE: "true"
+      TESTNET_ONLY_ACK: I_ACCEPT_TESTNET_ORDERS
+      TESTNET_SYMBOL: ${{ vars.TESTNET_SYMBOL || 'BTCUSDT' }}
+      TESTNET_ORDER_QTY: ${{ vars.TESTNET_ORDER_QTY }}
+      TESTNET_MAX_NOTIONAL_USDT: ${{ vars.TESTNET_MAX_NOTIONAL_USDT || '150' }}
+      IMPERION_STORAGE_DIR: ${{ github.workspace }}/testnet-run
+      TESTNET_EVIDENCE_OUTPUT: ${{ github.workspace }}/evidence/testnet-evidence.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - name: Required secrets and variables are present
+        run: |
+          test -n "$BINANCE_API_KEY" && test -n "$BINANCE_API_SECRET" || { echo "missing BINANCE_TESTNET_API_KEY / BINANCE_TESTNET_API_SECRET"; exit 1; }
+          test "${#TESTNET_EVIDENCE_SECRET}" -ge 32 || { echo "missing secret TESTNET_EVIDENCE_SECRET (>= 32 characters)"; exit 1; }
+          test -n "$TESTNET_ORDER_QTY" || { echo "missing repository variable TESTNET_ORDER_QTY"; exit 1; }
+      - name: Testnet validation (order lifecycle, One-way mode, exchange liquidation)
+        run: python -m imperion testnet-check
+      - name: Verify the signed evidence independently
+        id: verify
+        run: |
+          python -m imperion verify-evidence "$TESTNET_EVIDENCE_OUTPUT" | tee verify.txt
+          echo "sha256=$(sed -n 's/^EVIDENCE_SHA256=//p' verify.txt)" >> "$GITHUB_OUTPUT"
+          echo "### Testnet evidence" >> "$GITHUB_STEP_SUMMARY"
+          echo "SHA-256: \`$(sed -n 's/^EVIDENCE_SHA256=//p' verify.txt)\`" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: testnet-evidence
+          path: ${{ github.workspace }}/evidence/testnet-evidence.json
+          if-no-files-found: error
+          retention-days: 30
