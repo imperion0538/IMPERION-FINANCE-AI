@@ -1,30 +1,23 @@
 
 """IMPERION FINANCE AI V17 - Core integration tests.
 
-Tests:
-- Agent consensus and adaptive policy
-- Safe trade planning and liquidity targets
-- Structural invalidation and stop protection
-- Agent behaviour and vetoes
-- Director approval and NO TRADE decisions
+Covers consensus, adaptive policy, safe trade planning,
+agent vetoes, and the Director's approval decision chain.
 
-The tests must not weaken production risk controls.
+Safety invariants:
+- No invented structural profit targets.
+- Stops remain beyond authoritative invalidation.
+- Liquidity obstacles and costs can reject a trade.
+- Rejected decisions always remain NO TRADE.
 """
 
 import pytest
 
 from imperion.agents import AGENT_NAMES
 from imperion.agents.base import Agent, AgentContext
-from imperion.agents.context import (
-    DerivativesAgent,
-    ExternalAgent,
-)
+from imperion.agents.context import DerivativesAgent, ExternalAgent
 from imperion.agents.flow import MomentumAgent
-from imperion.agents.price import (
-    LiquidityAgent,
-    TriggerAgent,
-    ZoneAgent,
-)
+from imperion.agents.price import LiquidityAgent, TriggerAgent, ZoneAgent
 from imperion.analysis.priceaction.types import (
     Break,
     CandleSignal,
@@ -53,18 +46,10 @@ from imperion.core.policy import (
     effective_weights,
     profile,
 )
-from imperion.data.microstructure import (
-    BookStore,
-    TradeStore,
-)
+from imperion.data.microstructure import BookStore, TradeStore
 from imperion.data.universe import DerivativesStore
 from imperion.fakes import make_engine
-from imperion.models import (
-    BEARISH,
-    BULLISH,
-    NEUTRAL,
-    AgentReport,
-)
+from imperion.models import BEARISH, BULLISH, NEUTRAL, AgentReport
 from imperion.util import now_ms
 
 
@@ -73,9 +58,7 @@ DAY = STYLES["day"]
 
 
 def rep(name, d=BULLISH, c=0.7, **kw):
-    return AgentReport(
-        name, d, c, name, True, **kw
-    )
+    return AgentReport(name, d, c, name, True, **kw)
 
 
 def team(d=BULLISH, c=0.7, skip=()):
@@ -86,29 +69,30 @@ def team(d=BULLISH, c=0.7, skip=()):
     }
 
 
-# --------------------------------------------------
+# ============================================================
 # CONSENSUS AND POLICY
-# --------------------------------------------------
+# ============================================================
 
 def test_consensus_counts_weight_breadth_and_opposition():
-    c = consensus(
+    result = consensus(
         team(),
         AGENT_WEIGHTS,
         BULLISH,
         DEFAULT_THRESHOLDS,
     )
 
-    assert c["passed"]
-    assert c["net"] == pytest.approx(0.7)
-    assert len(c["agree"]) == len(AGENT_NAMES)
-    assert c["flow_confirmed"]
+    assert result["passed"]
+    assert result["net"] == pytest.approx(0.7)
+    assert len(result["agree"]) == len(AGENT_NAMES)
+    assert result["flow_confirmed"]
 
-    assert not consensus(
+    opposite = consensus(
         team(),
         AGENT_WEIGHTS,
         BEARISH,
         DEFAULT_THRESHOLDS,
-    )["passed"]
+    )
+    assert not opposite["passed"]
 
     opposing = (
         "orderflow",
@@ -132,29 +116,25 @@ def test_consensus_counts_weight_breadth_and_opposition():
         },
     }
 
-    c = consensus(
+    result = consensus(
         split,
         AGENT_WEIGHTS,
         BULLISH,
         DEFAULT_THRESHOLDS,
     )
 
-    assert not c["passed"]
+    assert not result["passed"]
     assert any(
         "OPPOSITION" in reason
-        for reason in c["reasons"]
+        for reason in result["reasons"]
     )
 
     few = {
         name: rep(name)
-        for name in (
-            "trend",
-            "structure",
-            "liquidity",
-        )
+        for name in ("trend", "structure", "liquidity")
     }
 
-    c = consensus(
+    result = consensus(
         few,
         AGENT_WEIGHTS,
         BULLISH,
@@ -163,7 +143,7 @@ def test_consensus_counts_weight_breadth_and_opposition():
 
     assert any(
         "TOO_FEW_AGENTS" in reason
-        for reason in c["reasons"]
+        for reason in result["reasons"]
     )
 
     flow_only = {
@@ -177,14 +157,14 @@ def test_consensus_counts_weight_breadth_and_opposition():
         )
     }
 
-    c = consensus(
+    result = consensus(
         flow_only,
         AGENT_WEIGHTS,
         BULLISH,
         DEFAULT_THRESHOLDS,
     )
 
-    assert "NO_PRICE_ACTION_AGREEMENT" in c["reasons"]
+    assert "NO_PRICE_ACTION_AGREEMENT" in result["reasons"]
 
     unavailable = {
         **team(),
@@ -194,34 +174,31 @@ def test_consensus_counts_weight_breadth_and_opposition():
         ),
     }
 
-    c = consensus(
+    result = consensus(
         unavailable,
         AGENT_WEIGHTS,
         BULLISH,
         DEFAULT_THRESHOLDS,
     )
 
-    assert "microstructure" not in c["agree"]
+    assert "microstructure" not in result["agree"]
 
 
 def test_regime_profiles_change_weights_and_thresholds_within_bounds():
-    tr = profile("TREND_UP")
-    rg = profile("RANGE")
-    vol = profile("VOLATILE")
+    trending = profile("TREND_UP")
+    ranging = profile("RANGE")
+    volatile = profile("VOLATILE")
 
-    assert tr["weights"]["trend"] > 1
-    assert rg["weights"]["trend"] < 1
+    assert trending["weights"]["trend"] > 1
+    assert ranging["weights"]["trend"] < 1
 
     assert (
-        vol["thresholds"]["min_net"]
+        volatile["thresholds"]["min_net"]
         > DEFAULT_THRESHOLDS["min_net"]
     )
-    assert vol["thresholds"]["min_agree"] == 5
+    assert volatile["thresholds"]["min_agree"] == 5
 
-    expansion = profile(
-        "RANGE",
-        "EXPANSION",
-    )
+    expansion = profile("RANGE", "EXPANSION")
 
     assert expansion["thresholds"]["min_net"] >= 0.26
     assert "EXPANSION" in expansion["name"]
@@ -237,7 +214,7 @@ def test_regime_profiles_change_weights_and_thresholds_within_bounds():
             "trend": 1.0,
             "made_up_engine": 9.0,
         },
-        tr,
+        trending,
     )
 
     assert weights["trend"] == pytest.approx(1.3)
@@ -248,9 +225,9 @@ def test_regime_profiles_change_weights_and_thresholds_within_bounds():
         check_weights({"trend": -1})
 
 
-# --------------------------------------------------
+# ============================================================
 # PLANNER
-# --------------------------------------------------
+# ============================================================
 
 def pmap(price=100.0, atr=1.0, **kw):
     base = dict(
@@ -298,8 +275,8 @@ def test_plan_uses_liquidity_targets_and_structural_stops():
     assert setup.stop < pb.invalidation
     assert facts["validated"] is True
 
-    # A target outside the maximum R/R is not
-    # silently fabricated or pulled closer.
+    # Targets beyond the style's maximum R/R
+    # must not be silently moved closer.
     far, reasons, facts = build_plan(
         "SOLUSDT",
         DAY,
@@ -322,8 +299,7 @@ def test_plan_uses_liquidity_targets_and_structural_stops():
     assert far is None
     assert reasons[0] == "PLAN_NO_ELIGIBLE_TARGET"
 
-    # No real downside liquidity target:
-    # never invent a SHORT TP2.
+    # No real downside target means no synthetic TP2.
     short, reasons, facts = build_plan(
         "SOLUSDT",
         DAY,
@@ -353,11 +329,15 @@ def test_plan_rejections():
             CFG,
         )
 
-    # Liquidity obstacle before the minimum
-    # acceptable room must block the trade.
-    setup, reasons, _ = plan(
+    # 1. Liquidity obstacle is too close.
+    setup, reasons, facts = plan(
         Playbook(
-            "x", "LONG", 1, [], 98.0, None
+            "x",
+            "LONG",
+            1,
+            [],
+            98.0,
+            None,
         ),
         pmap(
             pools_above=[
@@ -372,27 +352,45 @@ def test_plan_rejections():
         == "PLAN_INSUFFICIENT_LIQUIDITY_ROOM"
     )
 
-    # Excessive trading costs must block
-    # a trade with an insufficient edge.
-    setup, reasons, _ = plan(
+    # 2. Trading costs exceed the available edge.
+    #
+    # The target at 100.25 is deliberately within
+    # the eligible R/R range for the small ATR.
+    # This ensures the test actually reaches the
+    # Planner's cost-to-risk safety check.
+    #
+    # Previous value 101.0 caused the unrelated
+    # PLAN_NO_ELIGIBLE_TARGET rejection.
+    setup, reasons, facts = plan(
         Playbook(
-            "x", "LONG", 1, [], 99.9, None
+            "x",
+            "LONG",
+            1,
+            [],
+            99.9,
+            None,
         ),
         pmap(
             atr=0.05,
             pools_above=[
-                Pool(101.0, "HIGH", 1, 1)
+                Pool(100.25, "HIGH", 1, 1)
             ],
         ),
     )
 
     assert setup is None
     assert reasons[0] == "PLAN_COST_EXCEEDS_EDGE"
+    assert facts["cost_to_risk"] > CFG.max_cost_to_risk
 
-    # Invalidated trade geometry must be rejected.
-    setup, reasons, _ = plan(
+    # 3. Already invalidated setup.
+    setup, reasons, facts = plan(
         Playbook(
-            "x", "LONG", 1, [], 101.0, None
+            "x",
+            "LONG",
+            1,
+            [],
+            101.0,
+            None,
         ),
         pmap(),
     )
@@ -400,12 +398,15 @@ def test_plan_rejections():
     assert setup is None
     assert reasons[0] == "PLAN_ALREADY_INVALIDATED"
 
-    # Stop beyond the style's maximum distance
-    # must be rejected rather than tightened
-    # inside the playbook invalidation.
-    setup, reasons, _ = plan(
+    # 4. Structural stop is too wide.
+    setup, reasons, facts = plan(
         Playbook(
-            "x", "LONG", 1, [], 90.0, None
+            "x",
+            "LONG",
+            1,
+            [],
+            90.0,
+            None,
         ),
         pmap(recent_low=None),
     )
@@ -413,9 +414,8 @@ def test_plan_rejections():
     assert setup is None
     assert reasons[0] == "STOP_TOO_WIDE"
 
-    # A capped range must not bypass
-    # the minimum acceptable reward.
-    setup, reasons, _ = plan(
+    # 5. A range cap cannot bypass reward limits.
+    setup, reasons, facts = plan(
         Playbook(
             "range_fade",
             "LONG",
@@ -431,12 +431,16 @@ def test_plan_rejections():
     assert setup is None
     assert reasons
 
-    # A nearby minor structure does not justify
-    # moving the stop inside the playbook's
-    # authoritative invalidation.
-    setup, reasons, _ = plan(
+    # 6. Minor structure must not override
+    # the playbook's authoritative invalidation.
+    setup, reasons, facts = plan(
         Playbook(
-            "x", "LONG", 1, [], 90.0, None
+            "x",
+            "LONG",
+            1,
+            [],
+            90.0,
+            None,
         ),
         pmap(recent_low=98.5),
     )
@@ -444,11 +448,15 @@ def test_plan_rejections():
     assert setup is None
     assert reasons[0] == "STOP_TOO_WIDE"
 
-    # A minimum ATR distance may widen a stop,
-    # but cannot violate structural invalidation.
+    # 7. Minimum ATR stop distance is respected.
     setup, reasons, facts = plan(
         Playbook(
-            "x", "LONG", 1, [], 99.9, None
+            "x",
+            "LONG",
+            1,
+            [],
+            99.9,
+            None,
         ),
         pmap(
             atr=2.0,
@@ -470,7 +478,7 @@ def test_plan_rejections():
 
 
 def test_quality_and_grades():
-    q = quality(
+    result = quality(
         0.9,
         0.6,
         8,
@@ -482,8 +490,8 @@ def test_quality_and_grades():
         False,
     )
 
-    assert q >= 95
-    assert grade(q, DAY) == "A+"
+    assert result >= 95
+    assert grade(result, DAY) == "A+"
 
     weak = quality(
         0.5,
@@ -504,9 +512,9 @@ def test_quality_and_grades():
     assert grade(DAY.min_quality, DAY) == "B"
 
 
-# --------------------------------------------------
+# ============================================================
 # AGENTS
-# --------------------------------------------------
+# ============================================================
 
 def ctx(**kw):
     base = dict(
@@ -759,9 +767,9 @@ def test_whole_team_on_live_like_data():
         engine.stop()
 
 
-# --------------------------------------------------
+# ============================================================
 # DIRECTOR
-# --------------------------------------------------
+# ============================================================
 
 class Fixed(Agent):
     def __init__(self, name, report):
