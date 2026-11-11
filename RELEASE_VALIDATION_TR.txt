@@ -1,0 +1,22 @@
+IMPERION FINANCE v14.3.0 — RELEASE VALIDATION
+============================================
+
+Local offline checks:
+- Release metadata check: PASS
+- Offline release bundle check: PASS (12/12)
+- Python compileall: PASS
+- In-process fake-exchange execution safety selftest: PASS (all 9 scenarios)
+- Targeted pytest groups: PASS (143 distinct test cases observed passing across grouped runs)
+
+Important limits:
+- The entire pytest suite was not completed in this packaging environment's execution window. GitHub Actions CI is configured to run the complete suite on Python 3.11, 3.12 and 3.13 and must be green before production use.
+- No real Binance Demo/Testnet order was sent during this build.
+- No Docker daemon build was executed in this packaging environment.
+- No Railway deployment or persistent-volume/restart test was executed.
+- No live trading authorization or Testnet evidence is included in this archive.
+
+Live gate:
+- Default MODE=dry.
+- No live confirmation is set.
+- Binance Demo/Testnet signed evidence + manual approval are mandatory before MODE=live can place orders.
+- Do not bypass these controls.

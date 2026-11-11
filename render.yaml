@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: imperion-finance-v16
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    disk:
+      name: imperion-data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: MODE
+        value: dry
+      - key: IMPERION_STORAGE_DIR
+        value: /data
+      - key: RADAR_COUNT
+        value: "0"

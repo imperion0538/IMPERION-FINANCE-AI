@@ -1,0 +1,18 @@
+# V17.0.0 Build Validation
+
+Date: 2026-11-11
+
+## Passed
+- Python compileall: `python -m compileall -q imperion scripts`
+- Release metadata: `python scripts/release_check.py` (VERSION, config.VERSION, README and CHANGELOG agree)
+- Execution safety selftest: `python -m imperion selftest` — all 9 in-process fake-exchange checks passed.
+- Focused regression suite: `tests/test_v161_guards.py`, `tests/test_v16_intelligence.py`, `tests/test_unified_features.py`, `tests/test_safety_regressions.py` — 24 passed.
+
+## Not verified in this build environment
+- Full pytest suite: attempted, but the execution environment interrupted the run; no full-suite pass is claimed.
+- Additional broad core/risk/execution test group: exceeded the available execution window; no pass is claimed.
+- `pip-audit`, GitHub Actions, Docker image build/healthcheck, Render/Railway deployment, Binance Futures Testnet and real exchange behavior.
+- Profitability, strategy expectancy and out-of-sample performance.
+
+## Operational restriction
+Default mode remains `dry`. Do not use real funds until dependency/security audits, full CI, cloud health checks, fresh signed Binance Testnet evidence and the code's manual Live approval gate all pass.

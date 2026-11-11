@@ -1,0 +1,15 @@
+# Gitleaks (CI "security" job): default rules, plus an allowlist for the in-process fake exchange and the unit tests,
+# which use fixed, non-production placeholder keys (fake Binance keys, test HMAC evidence secret, admin token).
+# Real keys never belong in the repository: they live in GitHub secrets and the host environment only.
+title = "imperion-finance"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "fake exchange fixtures, unit tests and the documented empty .env template"
+paths = [
+  '''^imperion/fakes\.py$''',
+  '''^tests/''',
+  '''^\.env\.example$''',
+]
