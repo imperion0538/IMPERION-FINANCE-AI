@@ -1,0 +1,66 @@
+
+name: Extract IMPERION V17 ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "*.zip"
+
+permissions:
+  contents: write
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find and extract V17 ZIP
+        run: |
+          python - <<'PY'
+          import os
+          import zipfile
+          from pathlib import Path
+
+          zips = list(Path(".").glob("*.zip"))
+
+          if len(zips) != 1:
+              raise SystemExit(
+                  f"Bir adet ZIP bekleniyordu. Bulunan: {len(zips)}"
+              )
+
+          archive = zips[0]
+          print(f"ZIP bulundu: {archive.name}")
+
+          root = Path(".").resolve()
+
+          with zipfile.ZipFile(archive) as z:
+              for item in z.infolist():
+                  target = (root / item.filename).resolve()
+
+                  if not target.is_relative_to(root):
+                      raise SystemExit(
+                          f"Güvenli olmayan ZIP yolu: {item.filename}"
+                      )
+
+                  z.extract(item, root)
+
+          print("V17 ZIP başarıyla çıkarıldı.")
+          PY
+
+      - name: Commit extracted files
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "Extract IMPERION FINANCE V17"
+            git push
+          else
+            echo "Kaydedilecek yeni dosya bulunamadı."
+          fi
