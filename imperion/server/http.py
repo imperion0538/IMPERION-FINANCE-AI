@@ -173,7 +173,7 @@ def make_server(cfg: Settings, db: Database, api, host: str = "0.0.0.0", port: O
                 limiter.fail()
                 return self._send(401, {"error": "unauthorized"})
             try:
-                alert = normalize_alert(data, cfg.symbols)
+                alert = normalize_alert(data, api.execution_symbols() if hasattr(api, "execution_symbols") else cfg.symbols)
             except ValueError as exc:
                 return self._send(400, {"error": str(exc)})
             res = db.enqueue_webhook(idempotency_key(alert), alert)
