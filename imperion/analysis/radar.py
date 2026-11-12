@@ -1,8 +1,7 @@
-"""Tiered radar scan of the scan-only universe (never traded).
+"""Tiered Radar candidate analysis; this module never sends orders.
 
-  tier 1  every candidate (<= 30): cheap 1h reading -> eligibility (history, volatility band) and a score from trend
-          clarity, liquidity rank and the 24h move
-  tier 2  the best RADAR_DEEP_COUNT eligible candidates get the full Director analysis on deeper timeframes
+Tier 1 scores candidates using 1h data. Tier 2 selects a bounded subset for
+Director analysis. Runtime admission remains a separate opt-in gate.
 """
 from __future__ import annotations
 
