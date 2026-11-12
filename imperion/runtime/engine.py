@@ -474,11 +474,9 @@ class Engine:
         res["portfolio_guard"] = {"inventory": inventory, "toxicity": tox}
         if not inventory["allowed"]:
             blockers.append(inventory["reason"])
-        if blockers:
-            res.update(status="BLOCKED", approved=False)
-            res["reasons"] += blockers
-            self._store_decision(an, res, hint, force=True)
-            return res
+        # Retain portfolio vetoes while completing AI and data-quality
+        # reporting. The combined blocker gate below must pass before
+        # can_trade(), sizing or order execution can be reached.
         acct = None
         if self.exec is not None:
             try:
