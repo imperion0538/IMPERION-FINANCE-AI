@@ -21,7 +21,6 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN mkdir -p /data && chown -R imperion:imperion /data /app \
     && chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
-VOLUME ["/data"]
 EXPOSE 8080
 HEALTHCHECK --interval=60s --timeout=5s --start-period=120s --retries=3 \
   CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8080')+'/health',timeout=4)" || exit 1
