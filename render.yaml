@@ -15,3 +15,7 @@ services:
         value: /data
       - key: RADAR_COUNT
         value: "0"
+      - key: RADAR_TRADING_ENABLED
+        value: "false"
+      - key: RADAR_TRADE_ALLOWLIST
+        value: ""
