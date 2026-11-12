@@ -1,9 +1,10 @@
-
 """Runtime engine against the strict fake exchange.
 
 The Director is replaced by a crafted, approved analysis so these
-tests exercise the gates, risk, execution and persistence paths
-deterministically.
+tests exercise the gates, risk, execution and persistence paths.
+
+Decision-loop timing uses a controlled application clock.
+Production data-freshness checks are preserved.
 """
 
 import json
@@ -12,9 +13,10 @@ import time
 
 import pytest
 
+from imperion.config import STYLES
 from imperion.execution.sim import SimExecutor
 from imperion.fakes import FakeBinance, make_engine
-from imperion.util import now_ms
+from imperion.util import last_closed_open, now_ms
 
 from .helpers import crafted_analyze
 
@@ -22,11 +24,13 @@ from .helpers import crafted_analyze
 @pytest.fixture()
 def rig(monkeypatch):
     engine, fake = make_engine()
+
     monkeypatch.setattr(
         engine.director,
         "analyze",
         crafted_analyze(fake),
     )
+
     yield engine, fake
     engine.stop()
 
@@ -40,43 +44,51 @@ def trades(engine):
 def test_full_approved_path_places_entry_stop_and_targets(rig):
     engine, fake = rig
 
-    r = engine.evaluate("SOLUSDT", "day")
-    assert r["traded"] and r["status"] == "TRADED", r
+    result = engine.evaluate("SOLUSDT", "day")
 
-    t = trades(engine)[0]
     assert (
-        t["status"] == "OPEN"
-        and t["style"] == "day"
-        and t["side"] == "LONG"
-        and t["mode"] == "live"
+        result["traded"]
+        and result["status"] == "TRADED"
+    ), result
+
+    trade = trades(engine)[0]
+
+    assert (
+        trade["status"] == "OPEN"
+        and trade["style"] == "day"
+        and trade["side"] == "LONG"
+        and trade["mode"] == "live"
     )
 
     # Conservative 0.25% default risk.
-    assert 0.15 <= t["risk_usdt"] <= 0.30
+    assert 0.15 <= trade["risk_usdt"] <= 0.30
 
     kinds = sorted(
-        (a["orderType"], a["closePosition"])
-        for a in fake.algos
+        (order["orderType"], order["closePosition"])
+        for order in fake.algos
     )
+
     assert kinds == [
         ("STOP_MARKET", True),
         ("TAKE_PROFIT_MARKET", False),
         ("TAKE_PROFIT_MARKET", False),
     ]
 
-    dec = engine.db.one(
+    decision = engine.db.one(
         "SELECT * FROM decisions WHERE status='TRADED'"
     )
-    setup = json.loads(dec["setup_json"])
+
+    setup = json.loads(decision["setup_json"])
 
     assert (
-        dec["approved"] == 1
+        decision["approved"] == 1
         and setup["stop"] < setup["entry"]
         and setup["playbook"] == "trend_pullback"
         and setup["grade"] == "A"
     )
 
-    detail = json.loads(dec["evidence_json"])
+    detail = json.loads(decision["evidence_json"])
+
     assert (
         detail["agents"]["trend"]["d"] == "BULLISH"
         and detail["playbook"]["name"] == "trend_pullback"
@@ -87,14 +99,14 @@ def test_full_approved_path_places_entry_stop_and_targets(rig):
 
     shadow_meta = json.loads(shadow["meta_json"])
 
-    # V17 Unified Institutional core identity.
     assert (
         shadow_meta["core"]
         == "agents-1-v17-unified-institutional"
     )
     assert shadow_meta["playbook"] == "trend_pullback"
 
-    meta = json.loads(t["meta_json"])
+    meta = json.loads(trade["meta_json"])
+
     assert (
         meta["source"] == "loop"
         and meta["playbook"] == "trend_pullback"
@@ -110,12 +122,14 @@ def test_second_entry_rules(rig):
     assert engine.evaluate("SOLUSDT", "day")["traded"]
 
     again = engine.evaluate("SOLUSDT", "day")
+
     assert not again["traded"]
+
     assert any(
-        "SYMBOL_ALREADY" in x
-        or "COOLDOWN" in x
-        or "OPEN_RISK" in x
-        for x in again["reasons"]
+        "SYMBOL_ALREADY" in reason
+        or "COOLDOWN" in reason
+        or "OPEN_RISK" in reason
+        for reason in again["reasons"]
     )
 
     second_symbol = engine.evaluate("SOLUSDT", "day")
@@ -130,14 +144,17 @@ def test_second_entry_rules(rig):
 def test_never_trades_with_unhealthy_data(rig):
     engine, fake = rig
 
-    for conn in (engine.streams.market, engine.streams.public):
-        conn.connected = False
+    for connection in (
+        engine.streams.market,
+        engine.streams.public,
+    ):
+        connection.connected = False
 
-    r = engine.evaluate("SOLUSDT", "day")
+    result = engine.evaluate("SOLUSDT", "day")
 
     assert (
-        not r["traded"]
-        and r["status"] == "DATA_BLOCKED"
+        not result["traded"]
+        and result["status"] == "DATA_BLOCKED"
         and not trades(engine)
         and not fake.pos
     )
@@ -151,17 +168,23 @@ def test_halt_and_preflight_gate(rig):
     engine, fake = rig
 
     engine.halt("manual")
+
     assert (
         not engine.evaluate("SOLUSDT", "day")["traded"]
         and not trades(engine)
     )
 
     engine.resume()
+
     assert engine.evaluate("SOLUSDT", "day")["traded"]
 
-    e2, _ = make_engine(FakeBinance(withdrawals=True))
-    assert not e2.can_trade()[0]
-    e2.stop()
+    second_engine, _ = make_engine(
+        FakeBinance(withdrawals=True)
+    )
+
+    assert not second_engine.can_trade()[0]
+
+    second_engine.stop()
 
 
 def test_observe_only_never_posts(monkeypatch):
@@ -175,16 +198,19 @@ def test_observe_only_never_posts(monkeypatch):
         crafted_analyze(fake),
     )
 
-    r = engine.evaluate("SOLUSDT", "day")
+    result = engine.evaluate("SOLUSDT", "day")
 
-    assert r["status"] == "APPROVED_NOT_TRADED"
+    assert result["status"] == "APPROVED_NOT_TRADED"
+
     assert any(
-        "OBSERVE_ONLY" in x for x in r["reasons"]
+        "OBSERVE_ONLY" in reason
+        for reason in result["reasons"]
     )
 
     assert not [
-        c for c in fake.calls
-        if c[0] in ("POST", "DELETE")
+        call
+        for call in fake.calls
+        if call[0] in ("POST", "DELETE")
     ]
 
     assert engine.db.one(
@@ -196,30 +222,32 @@ def test_observe_only_never_posts(monkeypatch):
 
 def test_parallel_signals_open_only_one_position(rig):
     engine, fake = rig
-    out = []
+    results = []
 
-    ts = [
+    threads = [
         threading.Thread(
-            target=lambda: out.append(
+            target=lambda: results.append(
                 engine.evaluate("SOLUSDT", "day")
             )
         )
         for _ in range(4)
     ]
 
-    for t in ts:
-        t.start()
+    for thread in threads:
+        thread.start()
 
-    for t in ts:
-        t.join()
+    for thread in threads:
+        thread.join()
 
     assert sum(
-        1 for r in out if r["traded"]
+        1 for result in results if result["traded"]
     ) == 1
 
     assert len(trades(engine)) == 1
 
-    assert abs(fake.pos["SOLUSDT"]["qty"]) == pytest.approx(
+    assert abs(
+        fake.pos["SOLUSDT"]["qty"]
+    ) == pytest.approx(
         float(trades(engine)[0]["qty"])
     )
 
@@ -237,20 +265,21 @@ def test_short_side_and_tradingview_hint(monkeypatch):
         ),
     )
 
-    r = engine.evaluate(
+    result = engine.evaluate(
         "LINKUSDT",
         "swing",
         hint="SHORT",
         source="tradingview",
     )
 
-    assert r["traded"], r["reasons"]
+    assert result["traded"], result["reasons"]
 
-    t = trades(engine)[0]
+    trade = trades(engine)[0]
+
     assert (
-        t["side"] == "SHORT"
-        and t["stop"] > t["entry"] > t["tp2"]
-        and json.loads(t["meta_json"])["source"]
+        trade["side"] == "SHORT"
+        and trade["stop"] > trade["entry"] > trade["tp2"]
+        and json.loads(trade["meta_json"])["source"]
         == "tradingview"
     )
 
@@ -268,24 +297,24 @@ def test_ai_layer_can_only_block(rig):
         validated=False,
     )
 
-    r = engine.evaluate("SOLUSDT", "day")
+    result = engine.evaluate("SOLUSDT", "day")
 
     assert (
-        r["traded"]
-        and r["ai"]["p_win"] < 0.1
-        and not r["ai"]["blocked"]
+        result["traded"]
+        and result["ai"]["p_win"] < 0.1
+        and not result["ai"]["blocked"]
     )
 
     engine.learning.model.validated = True
 
-    r = engine.evaluate("LTCUSDT", "day")
+    result = engine.evaluate("LTCUSDT", "day")
 
     assert (
-        not r["traded"]
-        and r["status"] == "BLOCKED"
+        not result["traded"]
+        and result["status"] == "BLOCKED"
         and any(
-            "AI_LOW_WIN_PROBABILITY" in x
-            for x in r["reasons"]
+            "AI_LOW_WIN_PROBABILITY" in reason
+            for reason in result["reasons"]
         )
     )
 
@@ -294,33 +323,158 @@ def test_ai_layer_can_only_block(rig):
     )["c"] == 2, "vetoed setups stay shadow-tracked"
 
 
+@pytest.mark.parametrize(
+    "offset_ms",
+    (1, 59_999, 299_999),
+)
 def test_decision_pass_runs_each_series_once_per_candle(
-    rig,
     monkeypatch,
+    offset_ms,
 ):
-    engine, fake = rig
+    """Use one controlled clock for bootstrap and dispatch.
+
+    A real minute boundary during bootstrap can leave only some
+    symbols with the latest closed candle. Keep the test input
+    deterministic without relaxing production freshness checks.
+    """
+    import sys
+
+    from imperion.runtime import engine as runtime_engine
+
+    epoch = (
+        1_795_000_000_000 // 300_000
+    ) * 300_000
+
+    clock = {"now": epoch + offset_ms}
+
+    def controlled_now_ms():
+        return clock["now"]
+
+    # Load runtime modules before patching so pytest can restore
+    # their imported clock references after this test.
+    #
+    # Do not patch time.time(): shutdown deadlines and thread
+    # timeout accounting must continue using real time.
+    for name, module in list(sys.modules.items()):
+        if (
+            name.startswith("imperion.")
+            and hasattr(module, "now_ms")
+        ):
+            monkeypatch.setattr(
+                module,
+                "now_ms",
+                controlled_now_ms,
+            )
+
+    assert runtime_engine.now_ms() == clock["now"]
+
+    engine, fake = make_engine()
     calls = []
 
-    monkeypatch.setattr(
-        engine,
-        "evaluate",
-        lambda sym, style, hint=None,
-        source="loop", now=None:
-        calls.append((sym, style)) or {},
-    )
+    def record_evaluation(
+        symbol,
+        style,
+        hint=None,
+        source="loop",
+        now=None,
+    ):
+        assert now == clock["now"]
+        calls.append((symbol, style))
+        return {}
 
-    n = engine.decision_pass()
+    try:
+        monkeypatch.setattr(
+            engine,
+            "evaluate",
+            record_evaluation,
+        )
 
-    assert (
-        n
-        == len(engine.cfg.symbols)
-        * len(engine.cfg.active_styles)
-        == len(calls)
-    )
+        expected = {
+            (symbol, style)
+            for symbol in engine.cfg.symbols
+            for style in engine.cfg.active_styles
+        }
 
-    assert engine.decision_pass() == 0, (
-        "no new closed candle -> no re-evaluation"
-    )
+        # Verify the initial data, rather than assuming that
+        # every series was bootstrapped before a real boundary.
+        for symbol, style in expected:
+            trigger_tf = STYLES[style].trigger_tf
+
+            assert engine.candles.last_open(
+                symbol,
+                trigger_tf,
+            ) == last_closed_open(
+                clock["now"],
+                trigger_tf,
+            )
+
+        count = engine.decision_pass()
+
+        assert count == len(expected) == len(calls)
+        assert set(calls) == expected
+
+        assert engine.decision_pass() == 0, (
+            "no new closed candle -> no re-evaluation"
+        )
+
+        assert len(calls) == len(expected)
+
+        # Time passing alone must not authorize stale series.
+        clock["now"] += 60_000
+        calls.clear()
+
+        assert engine.decision_pass() == 0
+        assert calls == []
+
+        # Only this symbol receives a new closed 1m candle.
+        rows = engine.rest.klines(
+            "SOLUSDT",
+            "1m",
+            limit=3,
+        )
+
+        added = engine.candles.ingest(
+            "SOLUSDT",
+            "1m",
+            rows,
+            now=clock["now"],
+        )
+
+        assert added == 1
+        assert engine.decision_pass() == 1
+        assert calls == [("SOLUSDT", "scalp")]
+
+        assert engine.decision_pass() == 0
+        assert calls == [("SOLUSDT", "scalp")]
+
+        # The day-style trigger is independent of scalp.
+        clock["now"] = (
+            clock["now"] // 300_000 + 1
+        ) * 300_000 + 1
+
+        calls.clear()
+
+        rows = engine.rest.klines(
+            "SOLUSDT",
+            "5m",
+            limit=3,
+        )
+
+        engine.candles.ingest(
+            "SOLUSDT",
+            "5m",
+            rows,
+            now=clock["now"],
+        )
+
+        assert engine.decision_pass() == 1
+        assert calls == [("SOLUSDT", "day")]
+
+        assert engine.decision_pass() == 0
+        assert calls == [("SOLUSDT", "day")]
+
+    finally:
+        engine.stop()
 
 
 def test_restart_adopts_open_positions_and_finishes_them(
@@ -336,24 +490,32 @@ def test_restart_adopts_open_positions_and_finishes_them(
 
     assert engine.evaluate("SOLUSDT", "day")["traded"]
 
-    t = trades(engine)[0]
+    trade = trades(engine)[0]
     db = engine.db
 
     engine.stop()
 
-    e2, _ = make_engine(fake, db=db)
+    second_engine, _ = make_engine(
+        fake,
+        db=db,
+    )
 
-    assert len(e2.db.open_trades()) == 1
+    assert len(
+        second_engine.db.open_trades()
+    ) == 1
+
     assert "SOLUSDT" in fake.pos
 
     fake.set_price(
         "SOLUSDT",
-        t["stop"] * 0.999,
+        trade["stop"] * 0.999,
     )
 
-    e2.lifecycle.manage()
+    second_engine.lifecycle.manage()
 
-    closed = e2.db.get_trade(t["id"])
+    closed = second_engine.db.get_trade(
+        trade["id"]
+    )
 
     assert (
         closed["status"] == "CLOSED"
@@ -361,7 +523,7 @@ def test_restart_adopts_open_positions_and_finishes_them(
         and not fake.algos
     )
 
-    e2.stop()
+    second_engine.stop()
 
 
 def test_foreign_positions_are_counted_but_never_touched(rig):
@@ -377,9 +539,9 @@ def test_foreign_positions_are_counted_but_never_touched(rig):
     exposure = engine.lifecycle.exposure()
 
     assert any(
-        e["symbol"] == "DOTUSDT"
-        and e["meta"].get("foreign")
-        for e in exposure
+        row["symbol"] == "DOTUSDT"
+        and row["meta"].get("foreign")
+        for row in exposure
     )
 
     engine.lifecycle.manage()
@@ -387,8 +549,8 @@ def test_foreign_positions_are_counted_but_never_touched(rig):
     assert "DOTUSDT" in fake.pos
 
     assert any(
-        e["kind"] == "foreign_position"
-        for e in engine.db.events_since(0)
+        event["kind"] == "foreign_position"
+        for event in engine.db.events_since(0)
     )
 
     assert not engine.flatten()
@@ -424,7 +586,10 @@ def test_dry_mode_runs_end_to_end_with_simulated_fills(
         }
     )
 
-    assert isinstance(engine.exec, SimExecutor)
+    assert isinstance(
+        engine.exec,
+        SimExecutor,
+    )
 
     monkeypatch.setattr(
         engine.director,
@@ -432,26 +597,28 @@ def test_dry_mode_runs_end_to_end_with_simulated_fills(
         crafted_analyze(fake),
     )
 
-    px = fake.price("SOLUSDT")
+    price = fake.price("SOLUSDT")
 
     engine.trades.add(
         "SOLUSDT",
         now_ms(),
-        px,
+        price,
         10,
         False,
     )
 
-    r = engine.evaluate("SOLUSDT", "day")
-    assert r["traded"], r["reasons"]
+    result = engine.evaluate("SOLUSDT", "day")
 
-    t = trades(engine)[0]
-    assert t["mode"] == "dry"
+    assert result["traded"], result["reasons"]
+
+    trade = trades(engine)[0]
+
+    assert trade["mode"] == "dry"
 
     engine.trades.add(
         "SOLUSDT",
         now_ms() + 1,
-        t["tp2"] * 1.002,
+        trade["tp2"] * 1.002,
         10,
         False,
     )
@@ -459,7 +626,9 @@ def test_dry_mode_runs_end_to_end_with_simulated_fills(
     engine.manage_pass()
     engine.manage_pass()
 
-    done = engine.db.get_trade(t["id"])
+    done = engine.db.get_trade(
+        trade["id"]
+    )
 
     assert (
         done["status"] == "CLOSED"
@@ -467,8 +636,9 @@ def test_dry_mode_runs_end_to_end_with_simulated_fills(
     ), done
 
     assert not [
-        c for c in fake.calls
-        if c[0] == "POST"
+        call
+        for call in fake.calls
+        if call[0] == "POST"
     ], "dry mode must never POST to the exchange"
 
     engine.stop()
@@ -480,7 +650,10 @@ def test_critical_events_are_mailed_with_rate_limit(rig):
 
     engine.mailer = (
         lambda cfg, subject, text, html:
-        (sent.append((subject, text)) or (True, "sent"))
+        (
+            sent.append((subject, text))
+            or (True, "sent")
+        )
     )
 
     engine.risk.halt("test halt")
@@ -514,35 +687,43 @@ def test_maintenance_snapshot_status_and_secrets(rig):
     assert engine.deriv.get("SOLUSDT") is not None
     assert engine.radar.symbols()
 
-    assert set(engine.radar.symbols()).isdisjoint(
+    assert set(
+        engine.radar.symbols()
+    ).isdisjoint(
         engine.cfg.symbols
     ), "radar never overlaps the execution universe"
 
     assert all(
-        engine.candles.count(s, "1h") >= 100
-        for s in engine.radar.symbols()
+        engine.candles.count(symbol, "1h") >= 100
+        for symbol in engine.radar.symbols()
     ), "radar symbols get 1h history"
 
-    snap = engine.snapshot()
+    snapshot = engine.snapshot()
 
     assert (
-        set(snap["symbols"]) == set(engine.cfg.symbols)
-        and snap["radar"]
-        and snap["radar"][0]["bias_1h"]
+        set(snapshot["symbols"])
+        == set(engine.cfg.symbols)
+        and snapshot["radar"]
+        and snapshot["radar"][0]["bias_1h"]
     )
 
-    st = engine.status()
+    status = engine.status()
 
     assert (
-        st["trading_enabled"]
-        and st["equity"]["equity"]
+        status["trading_enabled"]
+        and status["equity"]["equity"]
         == pytest.approx(100.0, rel=0.01)
-        and st["core"].startswith("IMPERION Director")
+        and status["core"].startswith(
+            "IMPERION Director"
+        )
     )
 
     dumped = (
-        json.dumps(st, default=str)
-        + json.dumps(engine.health(), default=str)
+        json.dumps(status, default=str)
+        + json.dumps(
+            engine.health(),
+            default=str,
+        )
     )
 
     for secret in (
@@ -556,23 +737,23 @@ def test_maintenance_snapshot_status_and_secrets(rig):
 
 def test_real_director_path_runs_and_records_decisions():
     """Run the real Director on fake market data."""
-
     engine, fake = make_engine()
-    r = engine.evaluate("SOLUSDT", "day")
+
+    result = engine.evaluate("SOLUSDT", "day")
 
     assert (
-        r["status"] in (
+        result["status"] in (
             "NO_TRADE",
             "BLOCKED",
             "TRADED",
             "APPROVED",
             "APPROVED_NOT_TRADED",
         )
-        and r["reasons"]
+        and result["reasons"]
     )
 
-    assert set(r["agents"])
-    assert r["mtf"]["tfs"]
+    assert set(result["agents"])
+    assert result["mtf"]["tfs"]
 
     assert engine.db.one(
         "SELECT COUNT(*) c FROM decisions"
@@ -586,29 +767,34 @@ def test_real_director_path_runs_and_records_decisions():
 
 def test_threaded_runtime_smoke():
     """Run real threads with fake exchange and WebSocket."""
-
     engine, fake = make_engine(
         live_ws=True,
         warm=False,
         start=False,
     )
 
-    engine.start(http=False, threads=True)
+    engine.start(
+        http=False,
+        threads=True,
+    )
 
     try:
         time.sleep(6)
 
-        h = engine.health()
+        health = engine.health()
 
-        assert h["ready"] and h["ws_healthy"], h
+        assert (
+            health["ready"]
+            and health["ws_healthy"]
+        ), health
 
         assert all(
-            t.is_alive()
-            for t in engine._threads
+            thread.is_alive()
+            for thread in engine._threads
         ), [
-            t.name
-            for t in engine._threads
-            if not t.is_alive()
+            thread.name
+            for thread in engine._threads
+            if not thread.is_alive()
         ]
 
     finally:
@@ -629,3 +815,6 @@ def test_health_is_not_ready_until_startup_finishes(rig):
 
     assert health["ready"] is True
     assert health["ok"] is True
+
+
+# TEST_ENGINE_PY_END
