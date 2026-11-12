@@ -7,6 +7,8 @@ and are always blocked while the kill switch / halt flag is set. The default mod
 from __future__ import annotations
 
 import os
+import math
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -23,7 +25,7 @@ FIXED_SYMBOLS: Tuple[str, ...] = (
     "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT",
     "BCHUSDT", "SUIUSDT", "NEARUSDT", "APTUSDT",
 )
-DYNAMIC_SCAN_LIMIT = 30            # scan-only candidates (never traded)
+DYNAMIC_SCAN_LIMIT = 30            # candidate cap; execution requires separate admission
 MAX_SYMBOLS = 40
 TIMEFRAMES: Tuple[str, ...] = ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 LIVE_CONFIRM_PHRASE = "I_ACCEPT_REAL_MONEY_RISK"
@@ -68,6 +70,13 @@ def _f(name: str, default: float) -> float:
 
 def _i(name: str, default: int) -> int:
     return int(_f(name, default))
+
+
+def _strict_i(name: str, default: int) -> int:
+    value = _f(name, default)
+    if not math.isfinite(value) or int(value) != value:
+        raise ValueError(f"{name} must be an integer")
+    return int(value)
 
 
 def _s(name: str, default: str = "") -> str:
@@ -158,6 +167,13 @@ class Settings:
     max_stream_latency_ms: float = 8000.0
     log_level: str = "INFO"
 
+    # Radar admission is separate from fixed symbols and defaults to OFF.
+    radar_trading_enabled: bool = False
+    radar_trade_allowlist: Tuple[str, ...] = ()
+    radar_max_active: int = 3
+    radar_min_quote_volume: float = 10_000_000.0
+    radar_admission_ttl_seconds: int = 1200
+
     # ---- derived -------------------------------------------------------
     @property
     def has_credentials(self) -> bool:
@@ -194,6 +210,32 @@ class Settings:
         return "LIVE (real money)"
 
     def validate(self) -> None:
+        if not isinstance(self.radar_trading_enabled, bool):
+            raise ValueError("RADAR_TRADING_ENABLED must be boolean")
+        if not isinstance(self.radar_trade_allowlist, tuple):
+            raise ValueError("RADAR_TRADE_ALLOWLIST must be a tuple of symbols")
+        if len(set(self.radar_trade_allowlist)) != len(self.radar_trade_allowlist):
+            raise ValueError("RADAR_TRADE_ALLOWLIST contains duplicates")
+        for symbol in self.radar_trade_allowlist:
+            if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z0-9]{1,24}USDT", symbol):
+                raise ValueError("Invalid RADAR_TRADE_ALLOWLIST symbol")
+        for name, value, low, high in (
+            ("RADAR_MAX_ACTIVE", self.radar_max_active, 1, 10),
+            ("RADAR_ADMISSION_TTL_SECONDS", self.radar_admission_ttl_seconds, 60, 1800),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+                raise ValueError(f"{name} must be an integer in {low}..{high}")
+        if (isinstance(self.radar_min_quote_volume, bool)
+                or not isinstance(self.radar_min_quote_volume, (int, float))
+                or not math.isfinite(self.radar_min_quote_volume) or self.radar_min_quote_volume <= 0):
+            raise ValueError("RADAR_MIN_QUOTE_VOLUME must be finite and positive")
+        if self.radar_trading_enabled:
+            if not self.radar_trade_allowlist or self.radar_count < 1 or self.radar_deep_count < 1:
+                raise ValueError("Radar trading requires an allowlist and enabled scanning/deep analysis")
+            if "day" not in self.active_styles:
+                raise ValueError("Radar trading currently requires the day style")
+            if len(self.symbols) + self.radar_max_active > MAX_SYMBOLS:
+                raise ValueError("Combined execution universe exceeds MAX_SYMBOLS")
         if self.mode not in ("live", "testnet", "dry"):
             raise ValueError("MODE must be dry, testnet or live")
         bad = [s for s in self.active_styles if s not in STYLES]
@@ -271,6 +313,11 @@ def load_settings(env: Optional[Dict[str, str]] = None) -> Settings:
     styles = tuple(x.strip().lower() for x in _s("ACTIVE_STYLES", "scalp,day,swing").split(",") if x.strip())
 
     s = Settings(
+        radar_trading_enabled=env_bool("RADAR_TRADING_ENABLED", False),
+        radar_trade_allowlist=tuple(x.strip().upper() for x in _s("RADAR_TRADE_ALLOWLIST").split(",") if x.strip()),
+        radar_max_active=_strict_i("RADAR_MAX_ACTIVE", 3),
+        radar_min_quote_volume=_f("RADAR_MIN_QUOTE_VOLUME", 10_000_000.0),
+        radar_admission_ttl_seconds=_strict_i("RADAR_ADMISSION_TTL_SECONDS", 1200),
         mode=mode,
         live_confirm=_s("LIVE_TRADING_CONFIRM"),
         api_key=_s("BINANCE_API_KEY"),
