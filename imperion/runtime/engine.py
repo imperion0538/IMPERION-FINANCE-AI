@@ -28,6 +28,7 @@ from ..analysis.orderflow import live_flow
 from ..config import CORE_NAME, CORE_VERSION, STYLES, TIMEFRAMES, VERSION, Settings
 from ..core.director import Director
 from ..core.planner import round_trip_cost_pct
+from ..data.admission import FILTER_MAX_AGE_MS, RadarAdmission, fresh
 from ..data.candles import CandlePoller, CandleStore
 from ..data.health import HealthMonitor, data_quality_gate
 from ..data.microstructure import BookStore, TradeStore
@@ -73,6 +74,9 @@ class Engine:
         self.rest = rest or RestClient(cfg.rest_base, guard=self.guard, name="public")
         self.filters: Dict[str, SymbolFilters] = filters if filters is not None else {}
         self.mailer = mailer or daily.send_mail
+        self.admission = RadarAdmission(cfg)
+        self._filters_updated_ms = now_ms() if filters else 0
+        self._current_filter_symbols = set(self.filters)
 
         # market data
         self.candles, self.trades, self.books = CandleStore(), TradeStore(cfg.whale_floor_usdt), BookStore()
@@ -148,12 +152,16 @@ class Engine:
 
     def _load_filters(self) -> bool:
         try:
-            self.filters.update(parse_exchange_info(self.rest.exchange_info()))
+            current = parse_exchange_info(self.rest.exchange_info())
+            self.filters.update(current)
+            self._current_filter_symbols = set(current)
+            self._filters_updated_ms = now_ms()
             missing = [s for s in self.cfg.symbols if s not in self.filters]
             if missing:
                 self.db.event("ERROR", "filters_missing", f"exchangeInfo has no entry for {missing}")
             return not missing
         except Exception as exc:
+            self._filters_updated_ms = 0
             self.db.event("ERROR", "filters_failed", f"exchangeInfo failed: {exc}")
             return False
 
@@ -204,6 +212,7 @@ class Engine:
                 self.db.event("WARNING" if gate["ok"] else "CRITICAL", "live_gate",
                               "live gate OPEN (testnet evidence + manual approval)" if gate["ok"] else "LIVE GATE CLOSED: no order will be sent: " + "; ".join(gate["reasons"]))
             self._safe(lambda: self.lifecycle.manage(), "startup reconcile")
+            self._sync_execution_feeds()
             if cfg.user_stream and isinstance(self.exec, BinanceExecutor) and threads:
                 self.user_stream = UserStream(self.trade_rest, cfg.ws_base, cfg.user_stream_path, lambda _e: self._manage_wake.set(), self._ws_factory)
                 if not self.user_stream.start():
@@ -308,26 +317,79 @@ class Engine:
             return True
         return False
 
+    def _radar_symbol_allowed(self, symbol: str, now: int) -> bool:
+        if not self.cfg.radar_trading_enabled or symbol not in self.cfg.radar_trade_allowlist:
+            return False
+        if symbol not in self.admission.symbols(now) or symbol not in self.radar.symbols():
+            return False
+        ttl = self.cfg.radar_admission_ttl_seconds * 1000
+        if not fresh(self.radar.updated_ms, now, ttl) or not fresh(self._filters_updated_ms, now, FILTER_MAX_AGE_MS):
+            return False
+        f = self.filters.get(symbol)
+        return (symbol in self._current_filter_symbols and f is not None
+                and f.status == "TRADING" and f.contract_type == "PERPETUAL")
+
+    def _radar_entry_healthy(self, symbol: str, style) -> bool:
+        health = self.health_mon.symbol_health(symbol, style.all_tfs)
+        top = self.books.top(symbol)
+        trade_ts = self.trades.last_ts(symbol)
+        book_age = self.books.age_ms(symbol)
+        now = now_ms()
+        return bool(health.passed and top is not None and trade_ts > 0
+                    and book_age is not None and 0 <= book_age <= 8000
+                    and 0 <= now - trade_ts <= self.cfg.max_stream_latency_ms
+                    and 0 <= top[2] <= self.cfg.max_spread_pct)
+
+    def execution_symbols(self, style_name: Optional[str] = None, now: Optional[int] = None) -> List[str]:
+        """Current entry permissions; held/retired positions are NOT entry permissions."""
+        now = now if now is not None else now_ms()
+        dynamic = [] if style_name not in (None, "day") else [
+            s for s in self.admission.symbols(now) if self._radar_symbol_allowed(s, now)]
+        return list(dict.fromkeys(list(self.cfg.symbols) + dynamic))
+
+    def _held_symbols(self) -> List[str]:
+        # Persisted owned trades survive admission expiry and process restart.
+        return list(dict.fromkeys(row["symbol"] for row in self.db.open_trades()))
+
+    def _monitored_symbols(self) -> List[str]:
+        return list(dict.fromkeys(self.execution_symbols() + self._held_symbols()))
+
+    def _sync_execution_feeds(self) -> None:
+        self.poller.symbols = self._monitored_symbols()
+        self.streams.set_symbols(self._stream_symbols())
+
     def _stream_symbols(self) -> List[str]:
-        return list(dict.fromkeys(list(self.cfg.symbols) + self.radar.symbols()))
+        return list(dict.fromkeys(self._monitored_symbols() + self.radar.symbols()))
 
     def _refresh_radar(self) -> None:
         if self.cfg.radar_count <= 0:
             return
+        if self.cfg.radar_trading_enabled and not self._load_filters():
+            with self._trade_lock:
+                self.admission.clear()
+                self._sync_execution_feeds()
+            return
         syms = self.radar.refresh(self.rest, self.filters, self.cfg.symbols, self.cfg.radar_count)
         new = [s for s in syms if self.candles.count(s, RADAR_TF) == 0]
+        with self._trade_lock:
+            self.admission.revoke_missing(syms)
         self.radar_poller.symbols = list(syms)
         for s in new:                                  # radar symbols need history once; afterwards they are polled
             self._safe(lambda s=s: self.candles.ingest(s, RADAR_TF, self.rest.klines(s, RADAR_TF, limit=200)), f"radar bootstrap {s}")
-        self.streams.set_symbols(self._stream_symbols())
-        log.info("radar (scan-only, never traded): %s", ",".join(syms))
+        self._sync_execution_feeds()
+        log.info("radar candidates (admission required for trading): %s", ",".join(syms))
 
     def radar_scan(self) -> Dict[str, Any]:
-        """Tier 1 on every radar candidate, tier 2 (full Director analysis) on the best few. Scan-only: never trades."""
+        """Analyze Radar and update symbol permissions. This method never sends orders."""
+        if self.cfg.radar_trading_enabled:
+            with self._trade_lock:
+                self.admission.clear()
         self.radar_ranked = tier1(self.radar.candidates(), self.candles)
         deep = select_deep(self.radar_ranked, self.cfg.radar_deep_count)
         for s in deep:                                  # promoted candidates need deeper history once
-            for tf in DEEP_TFS:
+            required_tfs = (TIMEFRAMES if self.cfg.radar_trading_enabled
+                            and s in self.cfg.radar_trade_allowlist else DEEP_TFS)
+            for tf in required_tfs:
                 if self.candles.count(s, tf) < 150:
                     self._safe(lambda s=s, tf=tf: self.candles.ingest(s, tf, self.rest.klines(s, tf, limit=300)), f"radar deep bootstrap {s} {tf}")
         self.deep_poller.symbols = list(deep)
@@ -342,7 +404,16 @@ class Engine:
             if an.approved:
                 self.telegram.publish_scan(res)
         self.radar_deep = results
-        return {"ranked": self.radar_ranked, "deep": results}
+        with self._trade_lock:
+            current_filters = {s: self.filters[s] for s in self._current_filter_symbols if s in self.filters}
+            self.admission.replace(
+                self.radar_ranked, results, self.radar.updated_ms, current_filters,
+                self._filters_updated_ms, now_ms(),
+                lambda symbol: self.health_mon.symbol_health(symbol, STYLES["day"].all_tfs).passed,
+            )
+            self._sync_execution_feeds()
+        return {"ranked": self.radar_ranked, "deep": results,
+                "admission": self.admission.snapshot(now_ms())}
 
     def _account(self, fresh: bool = False):
         ts, acct = self._acct_cache
@@ -436,8 +507,8 @@ class Engine:
                 "mtf": an.mtf, "analysis_valid": False}
 
     def _evaluate(self, symbol: str, style_name: str, hint: Optional[str], source: str, now: Optional[int]) -> Dict[str, Any]:
-        if symbol not in self.cfg.symbols:
-            raise ValueError(f"{symbol} is not in the execution universe")
+        if symbol not in self.execution_symbols(style_name, now):
+            raise ValueError(f"{symbol} is not in the execution universe for {style_name}")
         style = STYLES[style_name]
         now = now if now is not None else now_ms()
         health = self.health_mon.symbol_health(symbol, style.all_tfs, now)
@@ -509,6 +580,18 @@ class Engine:
             self._set_status(decision_id, res["status"])
             return res
         with self._trade_lock:          # entries are serialised (decision loop + webhook threads)
+            # Admission can expire/revoke between analysis and the serialized entry.
+            if symbol not in self.execution_symbols(style_name):
+                res.update(status="BLOCKED", approved=False)
+                res["reasons"].append("RADAR_ADMISSION_EXPIRED_OR_REVOKED")
+                self._set_status(decision_id, "BLOCKED_AT_ENTRY")
+                return res
+            if symbol not in self.cfg.symbols:
+                if not self._radar_entry_healthy(symbol, style):
+                    res.update(status="BLOCKED", approved=False)
+                    res["reasons"].append("RADAR_ENTRY_DATA_UNHEALTHY")
+                    self._set_status(decision_id, "BLOCKED_AT_ENTRY")
+                    return res
             exposure = self._exposure()
             acct = self._account(fresh=True)
             equity = self.risk.trading_equity(acct.equity)
@@ -525,6 +608,15 @@ class Engine:
                 res["reasons"].append(f"LEVERAGE_BRACKETS_UNAVAILABLE ({type(exc).__name__})")
                 self._set_status(decision_id, "BLOCKED_SIZING")
                 return res
+            entry_inventory = self.inventory.assess(exposure, side, symbol)
+            if not entry_inventory["allowed"]:
+                res.update(status="BLOCKED", approved=False)
+                res["reasons"].append(entry_inventory["reason"])
+                self._set_status(decision_id, "BLOCKED_AT_ENTRY")
+                return res
+            entry_inventory["size_multiplier"] = min(inventory["size_multiplier"], entry_inventory["size_multiplier"])
+            inventory = entry_inventory
+            res["portfolio_guard"]["inventory"] = inventory
             sizing = self.risk.size(setup, self.exec.filters(symbol), equity, acct.available, brackets,
                                     risk_multiplier=inventory["size_multiplier"])
             if not sizing["ok"]:
@@ -536,7 +628,16 @@ class Engine:
                     "net": res["net"], "agree": res["agree"], "source": source, "hint": hint, "weights_version": an.weights_version,
                     "regime": an.regime.get("regime"), "session": an.regime.get("session"), "ai_p_win": ai.get("p_win"),
                     "snapshot": an.snapshot(), "notes": setup.notes, "core": CORE_VERSION,
-                    "inventory_guard": inventory, "toxicity_guard": tox}
+                    "inventory_guard": inventory, "toxicity_guard": tox,
+                    "execution_universe": "fixed" if symbol in self.cfg.symbols else "radar_admitted"}
+            # Remote account/bracket calls may take long enough to expire a lease.
+            if symbol not in self.cfg.symbols and (
+                    not self._radar_symbol_allowed(symbol, now_ms())
+                    or not self._radar_entry_healthy(symbol, style)):
+                res.update(status="BLOCKED", approved=False)
+                res["reasons"].append("RADAR_FINAL_ENTRY_CHECK_FAILED")
+                self._set_status(decision_id, "BLOCKED_AT_ENTRY")
+                return res
             trade = self.lifecycle.open_trade(setup, sizing, decision_id, meta)
         res["trade_id"], res["trade_status"] = trade["id"], trade["status"]
         res["traded"] = trade["status"] in ("OPEN", "CLOSING", "CLOSED")
@@ -593,10 +694,11 @@ class Engine:
 
     def decision_pass(self) -> int:
         now, n = now_ms(), 0
+        self._sync_execution_feeds()
         for style_name in self.cfg.active_styles:
             tf = STYLES[style_name].trigger_tf
             expected = last_closed_open(now, tf)
-            for sym in self.cfg.symbols:
+            for sym in self.execution_symbols(style_name, now):
                 have = self.candles.last_open(sym, tf)
                 if have is None or have < expected:
                     continue
@@ -622,6 +724,7 @@ class Engine:
                 if px:
                     self.exec.process_price(sym, px)
         self.lifecycle.manage()
+        self._sync_execution_feeds()
         if time.time() - self._timers.get("equity", 0) >= 15:
             self._timers["equity"] = time.time()
             acct = self._account(fresh=True)
@@ -729,7 +832,7 @@ class Engine:
     def snapshot(self) -> Dict[str, Any]:
         now = now_ms()
         symbols: Dict[str, Any] = {}
-        for s in self.cfg.symbols:
+        for s in self._monitored_symbols():
             last = self._last_result.get(s) or {}
             mtf = mtf_view(self.candles, s, TIMEFRAMES)
             flow = live_flow(self.trades, self.books, s, now)
@@ -767,7 +870,7 @@ class Engine:
         now = now_ms()
         style0 = STYLES[self.cfg.active_styles[0]]
         sym_health = {}
-        for s in self.cfg.symbols:
+        for s in self._monitored_symbols():
             h = self.health_mon.symbol_health(s, style0.all_tfs, now)
             sym_health[s] = {"passed": h.passed, "failed": [k for k, v in h.checks.items() if not v][:5]}
         return {
@@ -779,6 +882,9 @@ class Engine:
             "live_gate": self.live_gate(), "rate_limit": self.guard.stats(),
             "radar": [m["symbol"] for m in self.radar.markets], "radar_tiers": {"ranked": self.radar_ranked[:30], "deep": self.radar_deep},
             "ai": self.learning.summary(),
+            "execution_universe": {"fixed": list(self.cfg.symbols),
+                                   "radar": self.admission.snapshot(now),
+                                   "monitored": self._monitored_symbols()},
             "last_decisions": {s: {k: v for k, v in r.items() if k != "directional"} for s, r in self._last_result.items()},
             "recent_events": self.db.events_since(now - 6 * 3600_000, ("WARNING", "ERROR", "CRITICAL"))[-15:],
         }
