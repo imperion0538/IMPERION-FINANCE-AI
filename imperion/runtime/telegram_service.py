@@ -94,7 +94,7 @@ class TelegramService:
         db.kv_set("tg.last_event_id", rows[-1]["id"])
 
     def mtf_all(self) -> Dict[str, Dict[str, Any]]:
-        return {s: mtf_view(self.e.candles, s, TIMEFRAMES) for s in self.e.cfg.symbols}
+        return {s: mtf_view(self.e.candles, s, TIMEFRAMES) for s in self.e.execution_symbols()}
 
     def digest(self, force: bool = False) -> bool:
         db = self.e.db
@@ -128,8 +128,8 @@ class TelegramService:
             if sym and not sym.endswith("USDT"):
                 sym += "USDT"
             style = (parts[1].lower() if len(parts) > 1 else "") or ("day" if "day" in e.cfg.active_styles else e.cfg.active_styles[0])
-            if sym not in e.cfg.symbols:
-                return "Sembol bulunamadı. Örnek: /analiz SOLUSDT day\nİzlenenler: " + tgm.esc(", ".join(s.replace("USDT", "") for s in e.cfg.symbols))
+            if sym not in e.execution_symbols():
+                return "Sembol bulunamadı. Örnek: /analiz SOLUSDT day\nİzlenenler: " + tgm.esc(", ".join(s.replace("USDT", "") for s in e.execution_symbols()))
             if style not in e.cfg.active_styles:
                 return "Stil: " + tgm.esc(", ".join(e.cfg.active_styles))
             an = e.director.analyze(sym, style)                    # fresh read-only analysis, no shadow, no order
