@@ -1,7 +1,7 @@
-"""Scan-only radar universe and derivatives (funding) context.
+"""Radar candidate selection and derivatives context.
 
-The radar watches the most liquid USDT perpetuals OUTSIDE the configured execution universe. Radar symbols are
-analysed and reported, but the engine only ever evaluates trades for the configured symbols.
+Candidate presence never grants order permission. The runtime's optional
+admission layer separately authorizes operator-allowlisted candidates.
 """
 from __future__ import annotations
 
