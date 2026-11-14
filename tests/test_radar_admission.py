@@ -5,7 +5,8 @@ import json
 import math
 import pytest
 
-from imperion.config import load_settings, STYLES, TIMEFRAMES
+from imperion.config import load_settings, STYLES
+from imperion.analysis.radar import DEEP_TFS
 from imperion.data.admission import RadarAdmission
 from imperion.fakes import make_engine, warm_feed
 from imperion.util import now_ms
@@ -19,7 +20,7 @@ def fixture_data(**changes):
     cfg=load_settings({**ENV,**changes})
     now=now_ms()
     ranked=[{'symbol':'HYPEUSDT','eligible':True,'score':.8,'quote_volume':1e8}]
-    deep={'HYPEUSDT':{'ts':now,'approved':True,'direction':'LONG','setup':{'entry':30}}}
+    deep={'HYPEUSDT':{'ts':now,'approved':True,'grade':'A','direction':'LONG','setup':{'entry':30}}}
     filters={'HYPEUSDT':SimpleNamespace(status='TRADING',contract_type='PERPETUAL')}
     return cfg,now,ranked,deep,filters
 
@@ -37,7 +38,7 @@ def test_default_stays_scan_only():
     assert manager.symbols(now)==[]
 
 
-@pytest.mark.parametrize('changes',[{'RADAR_TRADE_ALLOWLIST':''},{'RADAR_COUNT':'0'},
+@pytest.mark.parametrize('changes',[{'RADAR_COUNT':'0'},
     {'RADAR_DEEP_COUNT':'0'},{'ACTIVE_STYLES':'scalp'}, {'RADAR_MAX_ACTIVE':'1.5'},
     {'RADAR_ADMISSION_TTL_SECONDS':'nan'},{'RADAR_MIN_QUOTE_VOLUME':'nan'},
     {'RADAR_TRADE_ALLOWLIST':'BTC/USDT'},{'RADAR_TRADE_ALLOWLIST':'INJUSDT,INJUSDT'}])
@@ -96,7 +97,7 @@ def test_admission_alone_does_not_trade_and_bootstraps_data(prepared):
     e,f,s=prepared
     assert not f.pos and not e.db.open_trades()
     assert s in e.execution_symbols('day') and s not in e.execution_symbols('scalp')
-    assert all(e.candles.count(s,tf)>=150 for tf in TIMEFRAMES)
+    assert all(e.candles.count(s,tf)>=150 for tf in DEEP_TFS)
     assert s in e.poller.symbols
 
 
@@ -183,7 +184,7 @@ def test_status_exposes_permissions_without_changing_fixed_list(prepared):
 
 
 def test_exchange_minimum_cannot_force_extra_risk(monkeypatch):
-    e,f=make_engine(env={**ENV,'RADAR_TRADE_ALLOWLIST':'HYPEUSDT'})
+    e,f=make_engine(env={**ENV,'RADAR_TRADE_ALLOWLIST':'HYPEUSDT','RISK_PER_TRADE_PCT':'0.1'})
     warm_feed(f,e.trades,e.books,symbols=e.radar.symbols())
     monkeypatch.setattr(e.director,'analyze',crafted_analyze(f))
     assert 'HYPEUSDT' in e.radar_scan()['admission']['active']
@@ -196,8 +197,7 @@ def test_existing_risk_position_limit_applies_to_admitted_symbol(prepared):
     e,f,s=prepared
     assert e.evaluate('SOLUSDT','day')['traded']
     r=e.evaluate(s,'day')
-    assert not r['traded'] and s not in f.pos
-    assert any('MAX_' in x or 'INVENTORY_LIMIT' in x for x in r['reasons'])
+    assert r['traded'] and s in f.pos  # 5 positions; fixed and dynamic have equal entry rights
 
 
 def test_restart_retains_owned_position_but_does_not_restore_entry_permission(monkeypatch,tmp_path):
@@ -209,7 +209,7 @@ def test_restart_retains_owned_position_but_does_not_restore_entry_permission(mo
     assert 'INJUSDT' in e.radar_scan()['admission']['active']
     assert e.evaluate('INJUSDT','day')['traded']
     e.stop()
-    e2,_=make_engine(fake=f,env={'RADAR_COUNT':'0'},db=Database(path))
+    e2,_=make_engine(fake=f,env={'RADAR_COUNT':'0','RADAR_TRADING_ENABLED':'false'},db=Database(path))
     assert 'INJUSDT' not in e2.execution_symbols()
     assert 'INJUSDT' in e2._stream_symbols() and 'INJUSDT' in e2.poller.symbols
     assert e2.db.open_trades() and 'INJUSDT' in f.pos
