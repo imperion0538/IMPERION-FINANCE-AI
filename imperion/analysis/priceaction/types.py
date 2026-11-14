@@ -275,6 +275,12 @@ class PAMap:
     news_blocked: bool = False
     invalidation_reasons: List[str] = field(default_factory=list)
 
+    # AUTONOMOUS PRO Volume Profile + Order Block (OHLCV-derived advisory evidence).
+    volume_profile: Dict[str, Any] = field(default_factory=dict)
+    vp_sessions: Dict[str, Any] = field(default_factory=dict)
+    vp_killzones: Dict[str, Any] = field(default_factory=dict)
+    vp_ob_confluence: List[Dict[str, Any]] = field(default_factory=list)
+
 
 @dataclass
 class Playbook:
