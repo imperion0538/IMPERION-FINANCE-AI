@@ -133,7 +133,8 @@ def guardian_recreates_missing_stop() -> None:
 
 
 def daily_loss_halts_and_clears_next_day() -> None:
-    bot, fake = make_engine()
+    # Test opt-in legacy loss/drawdown behavior; defaults remain disabled.
+    bot, fake = make_engine(env={"DAILY_LOSS_LIMIT_PCT": "1.5", "MAX_DRAWDOWN_PCT": "5"})
     bot.risk.update_equity(100.0)
     reason = bot.risk.update_equity(96.5)
     assert reason and "daily loss" in reason and bot.risk.halted()
