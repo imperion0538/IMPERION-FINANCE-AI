@@ -686,7 +686,8 @@ class Engine:
             return
         meta = {"playbook": s.playbook, "grade": an.grade, "quality": an.quality, "approved": an.approved,
                 "regime": an.regime.get("regime"), "session": an.regime.get("session"), "volatility": an.regime.get("volatility"),
-                "profile": an.regime.get("profile")}
+                "profile": an.regime.get("profile"),
+                "autonomous": an.regime.get("autonomous") or {}}
         self.shadows.record(None, an.symbol, an.style, s.side, s.entry, s.stop, s.tp1, s.tp2, an.snapshot(), source, meta=meta)
 
     def _note_result(self, an: Analysis, res: Dict[str, Any]) -> None:
@@ -864,7 +865,7 @@ class Engine:
         return subject, text
 
     def radar_snapshot(self) -> List[Dict[str, Any]]:
-        """Scan-only candidates with a 1h structure/trend reading. Never used for orders."""
+        """Radar monitoring view; separate A+/A admission can authorize later entry."""
         out = []
         now = now_ms()
         for m in self.radar.candidates():
