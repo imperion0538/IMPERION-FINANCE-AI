@@ -405,6 +405,35 @@ def build_plan(
     if not valid_order:
         return _reject("PLAN_INVALID_PRICE_GEOMETRY", facts)
 
+    # VP reference levels are advisory; V17's validated executable market entry,
+    # invalidation stop, target geometry and capital guard remain authoritative.
+    vp_candidates = [r for r in m.vp_ob_confluence
+                     if r.get("direction") == ("BULLISH" if long_ else "BEARISH")
+                     and r.get("preferred") is True
+                     and r.get("distance_atr", float("inf")) <= 1.5]
+    if vp_candidates and m.volume_profile:
+        from ..analysis.priceaction.volume_profile import (
+            VolumeProfile, refine_entry_stop_with_vp,
+        )
+        data = m.volume_profile
+        vp = VolumeProfile(poc=data["poc"], vah=data["vah"],
+                           val=data["val"], total_volume=data["volume"],
+                           hvn_levels=list(data.get("hvn") or []),
+                           lvn_levels=list(data.get("lvn") or []))
+        ref_entry, ref_stop, ref_note = refine_entry_stop_with_vp(
+            "BULLISH" if long_ else "BEARISH", entry, stop, vp, atr,
+        )
+        best = max(vp_candidates, key=lambda r: r["vp_score"])
+        facts["vp_ob_reference"] = {
+            "score": best["vp_score"], "reasons": best["reasons"],
+            "entry": ref_entry, "stop": ref_stop,
+            "note": ref_note, "executed": False,
+        }
+        notes.append(
+            "OB+VP evidence (OHLCV estimate); alternative entry/stop "
+            "is advisory only; V17 validated prices preserved"
+        )
+
     facts["tp1"] = tp1
     facts["tp2"] = tp2
     facts["validated"] = True
