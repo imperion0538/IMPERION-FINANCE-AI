@@ -613,11 +613,10 @@ class Director:
                 )
                 continue
 
-            if candidate_grade == "C":
+            if candidate_grade not in ("A+", "A"):
                 rejected.append(
-                    f"{tag}: QUALITY_BELOW_THRESHOLD "
-                    f"({candidate_quality:.0f} < "
-                    f"{style.min_quality:.0f})"
+                    f"{tag}: QUALITY_A_PLUS_OR_A_REQUIRED "
+                    f"(grade={candidate_grade}, score={candidate_quality:.1f}, minimum=77)"
                 )
                 continue
 
