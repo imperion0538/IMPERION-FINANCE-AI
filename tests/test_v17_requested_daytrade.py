@@ -24,7 +24,11 @@ def test_requested_defaults_are_actual_runtime_defaults():
                 cfg.max_daily_new_risk_pct, cfg.max_concurrent_positions) == (1.0, 10.0, 10.0, 5)
         assert cfg.radar_trading_enabled
         assert cfg.radar_trade_allowlist == ()
-        assert cfg.radar_count == cfg.radar_deep_count == cfg.radar_max_active == 30
+        assert cfg.radar_count == cfg.radar_deep_count == cfg.radar_max_active == 10
+        assert cfg.symbols == (
+            "BTCUSDT", "ETHUSDT", "AVAXUSDT", "INJUSDT", "LINKUSDT", "SOLUSDT",
+            "LTCUSDT", "DOTUSDT", "FILUSDT", "XRPUSDT", "SUIUSDT",
+        )
         assert cfg.max_risk_overshoot == 1.0
         assert cfg.daily_loss_limit_pct == cfg.max_drawdown_pct == 0
         assert cfg.consecutive_loss_pause == 0
@@ -83,13 +87,13 @@ def test_dynamic_radar_a_and_a_plus_without_manual_allowlist_and_b_denied():
     radar = RadarAdmission(cfg)
     now = now_ms()
     rows = [{"symbol":s, "eligible":True, "score":0.8, "quote_volume":10000000}
-            for s in ("HYPEUSDT", "INJUSDT", "FILUSDT")]
+            for s in ("HYPEUSDT", "BNBUSDT", "ADAUSDT")]
     deep = {s:{"ts":now, "approved":True, "grade":g, "direction":"LONG", "setup":{"entry":100}}
-            for s,g in (("HYPEUSDT","A+"),("INJUSDT","A"),("FILUSDT","B"))}
+            for s,g in (("HYPEUSDT","A+"),("BNBUSDT","A"),("ADAUSDT","B"))}
     filters={s:SimpleNamespace(status="TRADING",contract_type="PERPETUAL") for s in deep}
     radar.replace(rows,deep,radar_updated=now,filters=filters,filters_updated=now,now=now,healthy=lambda s:True)
-    assert radar.symbols(now) == ["HYPEUSDT", "INJUSDT"]
-    assert radar.snapshot(now)["rejected"]["FILUSDT"] == "DEEP_ANALYSIS_NOT_APPROVED"
+    assert radar.symbols(now) == ["HYPEUSDT", "BNBUSDT"]
+    assert radar.snapshot(now)["rejected"]["ADAUSDT"] == "DEEP_ANALYSIS_NOT_APPROVED"
 
 
 def test_engine_blocks_b_even_if_director_mock_approves():
@@ -119,14 +123,14 @@ def test_decision_pass_prioritizes_a_plus_across_fixed_symbols(monkeypatch):
     seen=[]
     try:
         def analysis(symbol,style,*args,**kwargs):
-            grade = "A+" if symbol == "DOGEUSDT" else "A"
+            grade = "A+" if symbol == "SUIUSDT" else "A"
             return crafted_analyze(fake,grade=grade,quality=92.0 if grade=="A+" else 80.0)(symbol,style)
         monkeypatch.setattr(engine.director,"analyze",analysis)
         monkeypatch.setattr(runtime_engine,"last_closed_open",lambda *args: -1)
         monkeypatch.setattr(engine,"evaluate",lambda symbol,style,**kwargs:seen.append((symbol,kwargs.get("prepared").grade)))
         assert engine.decision_pass()==len(engine.cfg.symbols)
         assert len(seen)==len(engine.cfg.symbols)
-        assert seen[0] == ("DOGEUSDT","A+")
+        assert seen[0] == ("SUIUSDT","A+")
         assert all(g == "A" for _,g in seen[1:])
         assert engine.decision_pass()==0
     finally:
