@@ -104,9 +104,9 @@ class RiskManager:
             # Percentages are measured against the allocated-equity proxy, not raw wallet equity.
             day_base, peak_base = start, peak
             # Drawdown is checked first: if both limits are breached the (non-lapsing) drawdown halt takes precedence.
-            if peak_base > 0 and (peak - equity_ref) / peak_base * 100 >= self.cfg.max_drawdown_pct:
+            if self.cfg.max_drawdown_pct > 0 and peak_base > 0 and (peak - equity_ref) / peak_base * 100 >= self.cfg.max_drawdown_pct:
                 reason = f"max drawdown {self.cfg.max_drawdown_pct}% reached (allocated equity {equity_ref:.2f} vs peak {peak:.2f})"
-            elif day_base > 0 and (equity_ref - start) / day_base * 100 <= -self.cfg.daily_loss_limit_pct:
+            elif self.cfg.daily_loss_limit_pct > 0 and day_base > 0 and (equity_ref - start) / day_base * 100 <= -self.cfg.daily_loss_limit_pct:
                 reason = f"daily loss limit {self.cfg.daily_loss_limit_pct}% reached (allocated equity {equity_ref:.2f} vs day start {start:.2f})"
             if reason and not self.halted():
                 self.halt(reason, "risk-manager")
@@ -127,7 +127,7 @@ class RiskManager:
             if r_multiple < -0.05:
                 n = (self.db.kv_get("risk.consec_losses", 0) or 0) + 1
                 self.db.kv_set("risk.consec_losses", n)
-                if n >= self.cfg.consecutive_loss_pause:
+                if self.cfg.consecutive_loss_pause > 0 and n >= self.cfg.consecutive_loss_pause:
                     until = now_ms() + self.cfg.loss_pause_minutes * 60_000
                     self.db.kv_set("risk.pause_until", until)
                     self.db.event("WARNING", "loss_pause", f"{n} consecutive losses: new entries paused {self.cfg.loss_pause_minutes} min")
@@ -171,6 +171,8 @@ class RiskManager:
 
         per_trade = trading_equity * self.cfg.risk_per_trade_pct / 100
         risk = new_risk_usdt if new_risk_usdt is not None else per_trade
+        if not math.isfinite(risk) or risk <= 0 or risk > per_trade + 1e-9:
+            reasons.append("PER_TRADE_RISK_LIMIT_OR_INVALID")
         open_risk = self.open_risk_usdt(open_trades)
         budget_ok = True
         if (open_risk + risk) / max(trading_equity, 1e-9) * 100 > self.cfg.max_open_risk_pct + 1e-9:
@@ -180,14 +182,8 @@ class RiskManager:
         if daily * 100 > self.cfg.max_daily_new_risk_pct + 1e-9:
             budget_ok = False
             reasons.append(f"DAILY_NEW_RISK_LIMIT ({daily * 100:.2f}% > {self.cfg.max_daily_new_risk_pct}%)")
-        if side:
-            same = sum(1 for t in open_trades if t["side"] == side)
-            if same >= MAX_SAME_DIRECTION:
-                budget_ok = False
-                reasons.append(f"SAME_DIRECTION_LIMIT ({same}>={MAX_SAME_DIRECTION})")
-            if any(t["symbol"] in CORRELATED.get(symbol, set()) and t["side"] == side for t in open_trades):
-                budget_ok = False
-                reasons.append("CORRELATION_GUARD (BTC/ETH/SOL/BNB same direction)")
+        # Day Trade requested policy: no arbitrary 2-same-direction or
+        # major-correlation veto. Exposure, stop and margin checks remain active.
         halted_or_paused = bool(halt) or pause > now_ms() or trading_equity < self.cfg.min_equity_usdt
         return {
             "allowed": not reasons,
@@ -209,8 +205,11 @@ class RiskManager:
         risk_usdt = trading_equity * cfg.risk_per_trade_pct / 100 * risk_multiplier
         entry = setup.entry
         fee_per_unit = entry * (2 * cfg.taker_fee_pct / 100)
-        unit_risk = abs(entry - setup.stop) + fee_per_unit
-        if unit_risk <= 0 or entry <= 0:
+        # Reserve both legs of expected slippage as well as round-trip taker fees.
+        # The fill-time hard cap is still checked in Lifecycle and may emergency-close.
+        slip_per_unit = entry * (2 * cfg.slippage_pct / 100)
+        unit_risk = abs(entry - setup.stop) + fee_per_unit + slip_per_unit
+        if not all(math.isfinite(v) for v in (entry, setup.stop, unit_risk)) or unit_risk <= 0 or entry <= 0:
             return {"ok": False, "reason": "SIZE_INVALID_INPUT"}
         qty = filt.floor_qty(risk_usdt / unit_risk)
         max_notional = trading_equity * cfg.leverage * 0.95
