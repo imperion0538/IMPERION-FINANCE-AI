@@ -19,14 +19,13 @@ VERSION = "17.0.0"
 CORE_NAME = "IMPERION Director Unified"
 CORE_VERSION = "agents-1-v17-unified-institutional"  # isolate V16 learning/shadow data from prior scoring semantics
 
-# Fixed execution universe (16 USDT perpetuals). Order = reporting order.
+# Fixed execution universe (11 USDT perpetuals). Order = reporting order.
 FIXED_SYMBOLS: Tuple[str, ...] = (
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT",
-    "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT",
-    "BCHUSDT", "SUIUSDT", "NEARUSDT", "APTUSDT",
+    "BTCUSDT", "ETHUSDT", "AVAXUSDT", "INJUSDT", "LINKUSDT", "SOLUSDT",
+    "LTCUSDT", "DOTUSDT", "FILUSDT", "XRPUSDT", "SUIUSDT",
 )
-DYNAMIC_SCAN_LIMIT = 30            # dynamic radar candidates, all may qualify for Day Trade admission
-MAX_SYMBOLS = 64
+DYNAMIC_SCAN_LIMIT = 10            # 10 dynamic Radar coins, independent of the 11 fixed coins
+MAX_SYMBOLS = 21
 TIMEFRAMES: Tuple[str, ...] = ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 LIVE_CONFIRM_PHRASE = "I_ACCEPT_REAL_MONEY_RISK"
 GRADES = ("A+", "A", "B")
