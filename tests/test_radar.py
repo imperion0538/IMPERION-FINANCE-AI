@@ -33,7 +33,7 @@ def test_tier1_scores_filters_and_ranks():
 def test_radar_scan_deepens_the_best_candidates_and_never_trades(monkeypatch):
     engine, fake = make_engine(env={"RADAR_DEEP_COUNT": "2", "RADAR_TRADING_ENABLED": "false"})
     engine._refresh_radar()
-    assert set(engine.radar.symbols()) == {"HYPEUSDT", "INJUSDT", "FILUSDT"}
+    assert set(engine.radar.symbols()) == {"BNBUSDT", "ADAUSDT", "DOGEUSDT"}
     real = engine.director.analyze
     approved = crafted_analyze(fake)
     monkeypatch.setattr(engine.director, "analyze", lambda sym, style, *a, **k: approved(sym, style) if sym in engine.radar.symbols() else real(sym, style, *a, **k))
