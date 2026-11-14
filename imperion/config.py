@@ -25,8 +25,8 @@ FIXED_SYMBOLS: Tuple[str, ...] = (
     "DOGEUSDT", "TRXUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "LTCUSDT",
     "BCHUSDT", "SUIUSDT", "NEARUSDT", "APTUSDT",
 )
-DYNAMIC_SCAN_LIMIT = 30            # candidate cap; execution requires separate admission
-MAX_SYMBOLS = 40
+DYNAMIC_SCAN_LIMIT = 30            # dynamic radar candidates, all may qualify for Day Trade admission
+MAX_SYMBOLS = 64
 TIMEFRAMES: Tuple[str, ...] = ("1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w")
 LIVE_CONFIRM_PHRASE = "I_ACCEPT_REAL_MONEY_RISK"
 GRADES = ("A+", "A", "B")
@@ -97,25 +97,25 @@ class Settings:
     spot_base: str = "https://api.binance.com"       # only for the API-key permission check
 
     symbols: Tuple[str, ...] = FIXED_SYMBOLS
-    active_styles: Tuple[str, ...] = ("scalp", "day", "swing")
+    active_styles: Tuple[str, ...] = ("day",)
     radar_count: int = DYNAMIC_SCAN_LIMIT
     whale_floor_usdt: float = 50_000.0
 
     trading_capital_usdt: float = 100.0
-    risk_per_trade_pct: float = 0.25
-    max_concurrent_positions: int = 1
-    max_open_risk_pct: float = 0.50
-    max_daily_new_risk_pct: float = 1.0
-    daily_loss_limit_pct: float = 1.5
-    max_drawdown_pct: float = 5.0
-    consecutive_loss_pause: int = 3
-    loss_pause_minutes: int = 240
+    risk_per_trade_pct: float = 1.0
+    max_concurrent_positions: int = 5
+    max_open_risk_pct: float = 10.0
+    max_daily_new_risk_pct: float = 10.0
+    daily_loss_limit_pct: float = 0.0
+    max_drawdown_pct: float = 0.0
+    consecutive_loss_pause: int = 0
+    loss_pause_minutes: int = 0
     leverage: int = 2
     max_leverage: int = 2
     taker_fee_pct: float = 0.05
     slippage_pct: float = 0.03
     max_cost_to_risk: float = 0.20
-    max_risk_overshoot: float = 1.25
+    max_risk_overshoot: float = 1.0
     max_spread_pct: float = 0.06
     min_equity_usdt: float = 20.0
 
@@ -145,7 +145,7 @@ class Settings:
     telegram_token: str = field(default="", repr=False)
     telegram_chat_id: str = field(default="", repr=False)
     telegram_signals: str = "approved"       # approved | setups | off
-    telegram_min_grade: str = "B"            # B | A | A+  (weakest grade that is published)
+    telegram_min_grade: str = "A"            # B | A | A+  (weakest grade that is published)
     telegram_trades: bool = True
     telegram_digest_hours: float = 4.0
     telegram_commands: bool = True
@@ -161,16 +161,16 @@ class Settings:
 
     live_gate_max_age_days: int = 30         # testnet evidence older than this no longer opens the live gate
     testnet_evidence_secret: str = field(default="", repr=False)   # HMAC key that signs / verifies testnet evidence
-    radar_deep_count: int = 5                # radar candidates promoted to a full (scan-only) Director analysis
+    radar_deep_count: int = DYNAMIC_SCAN_LIMIT                # radar candidates promoted to a full (scan-only) Director analysis
     telegram_radar: bool = True              # publish scan-only radar setups (never traded)
     regime_adaptive: bool = True             # regime-dependent agent weights and thresholds
     max_stream_latency_ms: float = 8000.0
     log_level: str = "INFO"
 
-    # Radar admission is separate from fixed symbols and defaults to OFF.
-    radar_trading_enabled: bool = False
-    radar_trade_allowlist: Tuple[str, ...] = ()
-    radar_max_active: int = 3
+    # Radar admission is automatic for eligible, freshly analysed A+/A day-trade symbols.
+    radar_trading_enabled: bool = True
+    radar_trade_allowlist: Tuple[str, ...] = ()   # optional narrowing only; empty means all validated radar candidates
+    radar_max_active: int = DYNAMIC_SCAN_LIMIT
     radar_min_quote_volume: float = 10_000_000.0
     radar_admission_ttl_seconds: int = 1200
 
@@ -220,7 +220,7 @@ class Settings:
             if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z0-9]{1,24}USDT", symbol):
                 raise ValueError("Invalid RADAR_TRADE_ALLOWLIST symbol")
         for name, value, low, high in (
-            ("RADAR_MAX_ACTIVE", self.radar_max_active, 1, 10),
+            ("RADAR_MAX_ACTIVE", self.radar_max_active, 1, DYNAMIC_SCAN_LIMIT),
             ("RADAR_ADMISSION_TTL_SECONDS", self.radar_admission_ttl_seconds, 60, 1800),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
@@ -230,8 +230,8 @@ class Settings:
                 or not math.isfinite(self.radar_min_quote_volume) or self.radar_min_quote_volume <= 0):
             raise ValueError("RADAR_MIN_QUOTE_VOLUME must be finite and positive")
         if self.radar_trading_enabled:
-            if not self.radar_trade_allowlist or self.radar_count < 1 or self.radar_deep_count < 1:
-                raise ValueError("Radar trading requires an allowlist and enabled scanning/deep analysis")
+            if self.radar_count < 1 or self.radar_deep_count < 1:
+                raise ValueError("Radar trading requires enabled scanning and deep analysis")
             if "day" not in self.active_styles:
                 raise ValueError("Radar trading currently requires the day style")
             if len(self.symbols) + self.radar_max_active > MAX_SYMBOLS:
@@ -239,16 +239,28 @@ class Settings:
         if self.mode not in ("live", "testnet", "dry"):
             raise ValueError("MODE must be dry, testnet or live")
         bad = [s for s in self.active_styles if s not in STYLES]
-        if bad or not self.active_styles:
-            raise ValueError(f"ACTIVE_STYLES must be a non-empty subset of {sorted(STYLES)} (got {list(self.active_styles)})")
-        if not 0 < self.risk_per_trade_pct <= 5:
-            raise ValueError("RISK_PER_TRADE_PCT must be in (0, 5]")
+        if bad or self.active_styles != ("day",):
+            raise ValueError("ACTIVE_STYLES must be day for this DAY TRADE strategy")
+        if not math.isfinite(self.risk_per_trade_pct) or not 0 < self.risk_per_trade_pct <= 1.0:
+            raise ValueError("RISK_PER_TRADE_PCT must be in (0, 1] for the requested strategy")
+        if not (math.isfinite(self.max_open_risk_pct) and 0 < self.max_open_risk_pct <= 10):
+            raise ValueError("MAX_OPEN_RISK_PCT must be in (0, 10]")
+        if not (math.isfinite(self.max_daily_new_risk_pct) and 0 < self.max_daily_new_risk_pct <= 10):
+            raise ValueError("MAX_DAILY_NEW_RISK_PCT must be in (0, 10]")
+        if not (math.isfinite(self.max_risk_overshoot) and 0 < self.max_risk_overshoot <= 1.0):
+            raise ValueError("MAX_RISK_OVERSHOOT must be in (0, 1]; per-trade risk cannot be exceeded")
+        if not (math.isfinite(self.daily_loss_limit_pct) and self.daily_loss_limit_pct >= 0):
+            raise ValueError("DAILY_LOSS_LIMIT_PCT must be >= 0 (0 disables optional loss policy)")
+        if not (math.isfinite(self.max_drawdown_pct) and self.max_drawdown_pct >= 0):
+            raise ValueError("MAX_DRAWDOWN_PCT must be >= 0 (0 disables optional drawdown policy)")
+        if not (isinstance(self.consecutive_loss_pause, int) and self.consecutive_loss_pause >= 0 and self.loss_pause_minutes >= 0):
+            raise ValueError("Loss pause settings must be non-negative")
         if not 1 <= self.leverage <= self.max_leverage <= 20:
             raise ValueError("LEVERAGE must be 1..MAX_LEVERAGE and MAX_LEVERAGE <= 20")
         if self.trading_capital_usdt <= 0:
             raise ValueError("TRADING_CAPITAL_USDT must be positive")
-        if self.max_concurrent_positions < 1:
-            raise ValueError("MAX_CONCURRENT_POSITIONS must be >= 1")
+        if self.max_concurrent_positions < 1 or self.max_concurrent_positions > 5:
+            raise ValueError("MAX_CONCURRENT_POSITIONS must be 1..5")
         if self.alert_email not in ("critical", "trades", "none"):
             raise ValueError("ALERT_EMAIL must be critical, trades or none")
         if self.telegram_signals not in ("approved", "setups", "off"):
@@ -286,8 +298,8 @@ class Settings:
             raise ValueError("LIVE_GATE_MAX_AGE_DAYS must be 1..90")
         if self.testnet_evidence_secret and len(self.testnet_evidence_secret) < 32:
             raise ValueError("TESTNET_EVIDENCE_SECRET must be at least 32 characters")
-        if not 0 <= self.radar_deep_count <= 10:
-            raise ValueError("RADAR_DEEP_COUNT must be 0..10")
+        if not 0 <= self.radar_deep_count <= DYNAMIC_SCAN_LIMIT:
+            raise ValueError(f"RADAR_DEEP_COUNT must be 0..{DYNAMIC_SCAN_LIMIT}")
         if not 0 <= self.radar_count <= DYNAMIC_SCAN_LIMIT:
             raise ValueError(f"RADAR_COUNT must be 0..{DYNAMIC_SCAN_LIMIT}")
 
@@ -310,12 +322,12 @@ def load_settings(env: Optional[Dict[str, str]] = None) -> Settings:
     rest_default = testnet_rest if mode == "testnet" else prod_rest
     ws_default = testnet_ws if mode == "testnet" else prod_ws
     symbols = tuple(x.strip().upper() for x in _s("SYMBOLS", ",".join(FIXED_SYMBOLS)).split(",") if x.strip())
-    styles = tuple(x.strip().lower() for x in _s("ACTIVE_STYLES", "scalp,day,swing").split(",") if x.strip())
+    styles = tuple(x.strip().lower() for x in _s("ACTIVE_STYLES", "day").split(",") if x.strip())
 
     s = Settings(
-        radar_trading_enabled=env_bool("RADAR_TRADING_ENABLED", False),
+        radar_trading_enabled=env_bool("RADAR_TRADING_ENABLED", True),
         radar_trade_allowlist=tuple(x.strip().upper() for x in _s("RADAR_TRADE_ALLOWLIST").split(",") if x.strip()),
-        radar_max_active=_strict_i("RADAR_MAX_ACTIVE", 3),
+        radar_max_active=_strict_i("RADAR_MAX_ACTIVE", DYNAMIC_SCAN_LIMIT),
         radar_min_quote_volume=_f("RADAR_MIN_QUOTE_VOLUME", 10_000_000.0),
         radar_admission_ttl_seconds=_strict_i("RADAR_ADMISSION_TTL_SECONDS", 1200),
         mode=mode,
@@ -332,20 +344,20 @@ def load_settings(env: Optional[Dict[str, str]] = None) -> Settings:
         radar_count=_i("RADAR_COUNT", DYNAMIC_SCAN_LIMIT),
         whale_floor_usdt=_f("WHALE_FLOOR_USDT", 50_000.0),
         trading_capital_usdt=_f("TRADING_CAPITAL_USDT", 100.0),
-        risk_per_trade_pct=_f("RISK_PER_TRADE_PCT", 0.25),
-        max_concurrent_positions=_i("MAX_CONCURRENT_POSITIONS", 1),
-        max_open_risk_pct=_f("MAX_OPEN_RISK_PCT", 0.50),
-        max_daily_new_risk_pct=_f("MAX_DAILY_NEW_RISK_PCT", 1.0),
-        daily_loss_limit_pct=_f("DAILY_LOSS_LIMIT_PCT", 1.5),
-        max_drawdown_pct=_f("MAX_DRAWDOWN_PCT", 5.0),
-        consecutive_loss_pause=_i("CONSECUTIVE_LOSS_PAUSE", 3),
-        loss_pause_minutes=_i("LOSS_PAUSE_MINUTES", 240),
+        risk_per_trade_pct=_f("RISK_PER_TRADE_PCT", 1.0),
+        max_concurrent_positions=_strict_i("MAX_CONCURRENT_POSITIONS", 5),
+        max_open_risk_pct=_f("MAX_OPEN_RISK_PCT", 10.0),
+        max_daily_new_risk_pct=_f("MAX_DAILY_NEW_RISK_PCT", 10.0),
+        daily_loss_limit_pct=_f("DAILY_LOSS_LIMIT_PCT", 0.0),
+        max_drawdown_pct=_f("MAX_DRAWDOWN_PCT", 0.0),
+        consecutive_loss_pause=_strict_i("CONSECUTIVE_LOSS_PAUSE", 0),
+        loss_pause_minutes=_strict_i("LOSS_PAUSE_MINUTES", 0),
         leverage=_i("LEVERAGE", 2),
         max_leverage=_i("MAX_LEVERAGE", 2),
         taker_fee_pct=_f("TAKER_FEE_PCT", 0.05),
         slippage_pct=_f("SLIPPAGE_PCT", 0.03),
         max_cost_to_risk=_f("MAX_COST_TO_RISK", 0.20),
-        max_risk_overshoot=_f("MAX_RISK_OVERSHOOT", 1.25),
+        max_risk_overshoot=_f("MAX_RISK_OVERSHOOT", 1.0),
         max_spread_pct=_f("MAX_SPREAD_PCT", 0.06),
         min_equity_usdt=_f("MIN_EQUITY_USDT", 20.0),
         kill_switch=env_bool("KILL_SWITCH", False),
@@ -371,7 +383,7 @@ def load_settings(env: Optional[Dict[str, str]] = None) -> Settings:
         telegram_token=_s("TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=_s("TELEGRAM_CHAT_ID"),
         telegram_signals=_s("TELEGRAM_SIGNALS", "approved").lower(),
-        telegram_min_grade=_s("TELEGRAM_MIN_GRADE", "B").upper(),
+        telegram_min_grade=_s("TELEGRAM_MIN_GRADE", "A").upper(),
         telegram_trades=env_bool("TELEGRAM_TRADES", True),
         telegram_digest_hours=_f("TELEGRAM_DIGEST_HOURS", 4.0),
         telegram_commands=env_bool("TELEGRAM_COMMANDS", True),
@@ -385,7 +397,7 @@ def load_settings(env: Optional[Dict[str, str]] = None) -> Settings:
         user_stream_path=_s("USER_STREAM_PATH", "private/ws").strip("/"),
         live_gate_max_age_days=_i("LIVE_GATE_MAX_AGE_DAYS", 30),
         testnet_evidence_secret=_s("TESTNET_EVIDENCE_SECRET"),
-        radar_deep_count=_i("RADAR_DEEP_COUNT", 5),
+        radar_deep_count=_strict_i("RADAR_DEEP_COUNT", DYNAMIC_SCAN_LIMIT),
         telegram_radar=env_bool("TELEGRAM_RADAR", True),
         regime_adaptive=env_bool("REGIME_ADAPTIVE", True),
         max_stream_latency_ms=_f("MAX_STREAM_LATENCY_MS", 8000.0),
