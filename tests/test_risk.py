@@ -94,7 +94,10 @@ def test_settings_validation_and_live_gate():
         with pytest.raises(ValueError):
             load_settings(bad)
     assert load_settings({"MODE": "testnet"}).trade_base == "https://demo-fapi.binance.com"
-    assert len(load_settings({}).symbols) == 16 and "BNBUSDT" in load_settings({}).symbols
+    assert load_settings({}).symbols == (
+        "BTCUSDT", "ETHUSDT", "AVAXUSDT", "INJUSDT", "LINKUSDT", "SOLUSDT",
+        "LTCUSDT", "DOTUSDT", "FILUSDT", "XRPUSDT", "SUIUSDT",
+    )
 
 
 def test_secrets_are_not_in_repr():
