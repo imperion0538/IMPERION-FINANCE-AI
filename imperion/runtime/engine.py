@@ -15,6 +15,7 @@ signals, shadow learning and reports, but it can never send an order.
 from __future__ import annotations
 
 import json
+import math
 import logging
 import threading
 import time
@@ -318,7 +319,7 @@ class Engine:
         return False
 
     def _radar_symbol_allowed(self, symbol: str, now: int) -> bool:
-        if not self.cfg.radar_trading_enabled or symbol not in self.cfg.radar_trade_allowlist:
+        if not self.cfg.radar_trading_enabled or (self.cfg.radar_trade_allowlist and symbol not in self.cfg.radar_trade_allowlist):
             return False
         if symbol not in self.admission.symbols(now) or symbol not in self.radar.symbols():
             return False
@@ -387,8 +388,7 @@ class Engine:
         self.radar_ranked = tier1(self.radar.candidates(), self.candles)
         deep = select_deep(self.radar_ranked, self.cfg.radar_deep_count)
         for s in deep:                                  # promoted candidates need deeper history once
-            required_tfs = (TIMEFRAMES if self.cfg.radar_trading_enabled
-                            and s in self.cfg.radar_trade_allowlist else DEEP_TFS)
+            required_tfs = DEEP_TFS  # Day Trade only: 5m/15m/1h/4h; no mandatory allowlist
             for tf in required_tfs:
                 if self.candles.count(s, tf) < 150:
                     self._safe(lambda s=s, tf=tf: self.candles.ingest(s, tf, self.rest.klines(s, tf, limit=300)), f"radar deep bootstrap {s} {tf}")
@@ -398,7 +398,7 @@ class Engine:
             an = self.director.analyze(s, DEEP_STYLE)
             res = self._result(an)
             res["status"] = "SCAN_ONLY"
-            results[s] = {"ts": an.ts, "direction": an.direction, "approved": an.approved, "grade": an.grade, "quality": an.quality,
+            results[s] = {"ts": an.ts, "direction": an.direction, "approved": an.approved and an.grade in ("A+", "A"), "grade": an.grade, "quality": an.quality,
                           "playbook": res["playbook"]["name"] if res["playbook"] else None, "reasons": an.reasons[:3],
                           "setup": res["setup"] if an.approved else None}
             if an.approved:
@@ -487,9 +487,9 @@ class Engine:
         return True if top is None else top[2] <= self.cfg.max_spread_pct
 
     def evaluate(self, symbol: str, style_name: str, hint: Optional[str] = None, source: str = "loop",
-                 now: Optional[int] = None) -> Dict[str, Any]:
+                 now: Optional[int] = None, prepared: Optional[Analysis] = None) -> Dict[str, Any]:
         """Full pipeline for one (symbol, style). Opens a trade only if every gate passes; publishes the signal."""
-        res = self._evaluate(symbol, style_name, hint, source, now)
+        res = self._evaluate(symbol, style_name, hint, source, now, prepared=prepared)
         self.telegram.publish_signal(res)
         return res
 
@@ -506,13 +506,17 @@ class Engine:
                            "session": an.regime.get("session")},
                 "mtf": an.mtf, "analysis_valid": False}
 
-    def _evaluate(self, symbol: str, style_name: str, hint: Optional[str], source: str, now: Optional[int]) -> Dict[str, Any]:
+    def _evaluate(self, symbol: str, style_name: str, hint: Optional[str], source: str, now: Optional[int],
+                  prepared: Optional[Analysis] = None) -> Dict[str, Any]:
+        if style_name != "day":
+            raise ValueError("DAY_TRADE_ONLY: scalp and swing are not permitted")
         if symbol not in self.execution_symbols(style_name, now):
             raise ValueError(f"{symbol} is not in the execution universe for {style_name}")
         style = STYLES[style_name]
         now = now if now is not None else now_ms()
         health = self.health_mon.symbol_health(symbol, style.all_tfs, now)
-        an = self.director.analyze(symbol, style_name, hint, now, data_ok=health.passed, health_quality=health.quality)
+        an = (prepared if prepared is not None else
+              self.director.analyze(symbol, style_name, hint, now, data_ok=health.passed, health_quality=health.quality))
         self.last_analysis[(symbol, style_name)] = an
         res = self._result(an)
         self._note_result(an, res)
@@ -523,7 +527,9 @@ class Engine:
             return res
         if an.setup is not None:
             self._record_shadow(an, source)
-        if not an.approved:
+        if not an.approved or an.grade not in ("A+", "A"):
+            if an.approved and an.grade not in ("A+", "A"):
+                res["reasons"].append("QUALITY_A_PLUS_OR_A_REQUIRED")
             res["status"] = "BLOCKED" if an.setup is not None else "NO_TRADE"
             self._store_decision(an, res, hint, force=bool(hint) or an.setup is not None)
             return res
@@ -624,6 +630,14 @@ class Engine:
                 res["reasons"].append(sizing["reason"])
                 self._set_status(decision_id, "BLOCKED_SIZING")
                 return res
+            # Verify the real rounded, fee-aware order risk against remaining budgets.
+            exact = self.risk.precheck(symbol, style, side, exposure, equity,
+                                       new_risk_usdt=sizing["risk_usdt"])
+            if not exact["allowed"]:
+                res.update(status="BLOCKED", approved=False)
+                res["reasons"] += exact["reasons"]
+                self._set_status(decision_id, "BLOCKED_EXACT_RISK")
+                return res
             meta = {"quality": an.quality, "grade": an.grade, "playbook": an.playbook.name if an.playbook else None,
                     "net": res["net"], "agree": res["agree"], "source": source, "hint": hint, "weights_version": an.weights_version,
                     "regime": an.regime.get("regime"), "session": an.regime.get("session"), "ai_p_win": ai.get("p_win"),
@@ -693,8 +707,14 @@ class Engine:
             self.deep_poller.poll_due()
 
     def decision_pass(self) -> int:
-        now, n = now_ms(), 0
+        """Collect every fresh Day Trade candidate first; execute A+ before A.
+
+        The analysis stage cannot place orders. Every final entry is still
+        rechecked under the existing trade lock and all exchange safety gates.
+        """
+        now = now_ms()
         self._sync_execution_feeds()
+        pending = []
         for style_name in self.cfg.active_styles:
             tf = STYLES[style_name].trigger_tf
             expected = last_closed_open(now, tf)
@@ -706,9 +726,33 @@ class Engine:
                 if self._last_eval.get(key) == have:
                     continue
                 self._last_eval[key] = have
-                self._safe(lambda: self.evaluate(sym, style_name, source="loop", now=now), f"evaluate {sym}/{style_name}")
-                n += 1
-        return n
+                prepared = None
+                quality = 0.0
+                rank = 2  # non-tradable results are still evaluated and reported
+                try:
+                    health = self.health_mon.symbol_health(sym, STYLES[style_name].all_tfs, now)
+                    prepared = self.director.analyze(
+                        sym, style_name, None, now,
+                        data_ok=health.passed, health_quality=health.quality,
+                    )
+                    if (health.passed and prepared.approved and prepared.setup is not None
+                            and prepared.direction in ("LONG", "SHORT")):
+                        rank = {"A+": 0, "A": 1}.get(prepared.grade, 2)
+                        quality = (float(prepared.quality)
+                                   if isinstance(prepared.quality, (int, float)) and math.isfinite(prepared.quality)
+                                   else 0.0)
+                except Exception as exc:
+                    # A failed preliminary analysis must never grant permission.
+                    # Let the normal error-reporting path attempt evaluation once.
+                    self._throttled_error(f"prepare-{sym}",
+                                          f"Pre-analysis {sym}/{style_name}: {type(exc).__name__}: {exc}")
+                pending.append((rank, -quality, sym, style_name, prepared))
+        pending.sort(key=lambda row: (row[0], row[1], row[2]))
+        for _, _, sym, style_name, prepared in pending:
+            self._safe(lambda sym=sym, style_name=style_name, prepared=prepared:
+                       self.evaluate(sym, style_name, source="loop", now=now, prepared=prepared),
+                       f"evaluate {sym}/{style_name}")
+        return len(pending)
 
     def _loop_decision(self) -> None:
         self._stop.wait(5.0)
