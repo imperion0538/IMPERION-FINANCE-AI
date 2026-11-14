@@ -31,7 +31,7 @@ def test_tier1_scores_filters_and_ranks():
 
 
 def test_radar_scan_deepens_the_best_candidates_and_never_trades(monkeypatch):
-    engine, fake = make_engine(env={"RADAR_DEEP_COUNT": "2"})
+    engine, fake = make_engine(env={"RADAR_DEEP_COUNT": "2", "RADAR_TRADING_ENABLED": "false"})
     engine._refresh_radar()
     assert set(engine.radar.symbols()) == {"HYPEUSDT", "INJUSDT", "FILUSDT"}
     real = engine.director.analyze
@@ -53,7 +53,7 @@ def test_radar_scan_deepens_the_best_candidates_and_never_trades(monkeypatch):
 def test_scan_signals_are_marked_scan_only(monkeypatch):
     from .test_telegram import TG, FakeTelegram
     cap = FakeTelegram()
-    engine, fake = make_engine(env={**TG, "RADAR_DEEP_COUNT": "3"}, telegram_transport=cap)
+    engine, fake = make_engine(env={**TG, "RADAR_DEEP_COUNT": "3", "RADAR_TRADING_ENABLED": "false"}, telegram_transport=cap)
     engine.tg.min_interval = 0.0
     engine.tg.flush(); cap.sent.clear()
     engine._refresh_radar()
