@@ -195,7 +195,7 @@ def format_signal(res: Dict[str, Any], mode: str) -> str:
     status = res.get("status", "")
     tag = {"TRADED": "İŞLEM AÇILDI", "APPROVED": "ONAYLANDI", "APPROVED_NOT_TRADED": "SİNYAL (emir gönderilmedi)",
            "ENTRY_FAILED": "ONAYLANDI (giriş başarısız)",
-           "SCAN_ONLY": "TARAMA LİSTESİ — yalnızca izleme, bu sembolde işlem açılmaz"}.get(status, "KURULUM (risk / AI engeli)")
+           "SCAN_ONLY": "RADAR ÖN ANALİZİ — bu adım emir göndermez"}.get(status, "KURULUM (risk / AI engeli)")
     mk, ai, grade = res.get("market") or {}, res.get("ai") or {}, res.get("grade") or "-"
     lines = [
         f"{icon} <b>{esc(res.get('symbol'))} {esc(side)}</b> · {esc(STYLE_TR.get(res.get('style'), res.get('style')))} · "
@@ -246,11 +246,11 @@ def format_digest(snapshot: Dict[str, Any], mtf_by_symbol: Dict[str, Dict[str, A
         lines.append(mtf_line(mtf.get("tfs") or {}))
     radar = [r for r in (snapshot.get("radar") or []) if r.get("bias_1h") in ("BULLISH", "BEARISH")][:8]
     if radar:
-        lines += ["", "<b>Tarama listesi (yalnızca izleme, 1s)</b>"]
+        lines += ["", "<b>Radar ön tarama (1s; işlem kabulü ayrıca yapılır)</b>"]
         lines += [f"{ARROW.get(r['bias_1h'], '▫️')} {esc(r['symbol'].replace('USDT', ''))} {num(r.get('price_change_pct'), 3)}% / 24s" for r in radar]
     deep = snapshot.get("radar_deep") or {}
     if deep:
-        lines += ["", "<b>Tarama — derin analiz (işlem yok)</b>"]
+        lines += ["", "<b>Radar derin analiz (A+/A ayrıca onaylanır)</b>"]
         lines += [f"{esc(s.replace('USDT', ''))}: {esc(d.get('direction'))} {esc(d.get('grade') or '')} {esc(PB_TR.get(d.get('playbook'), d.get('playbook') or ''))}"
                   for s, d in deep.items()]
     lines += ["", f"Durdurma: {esc(risk.get('halted') or 'yok')} · günlük yeni risk: {esc(risk.get('daily_new_risk_pct', 0))}%",
@@ -288,6 +288,16 @@ def format_analysis(symbol: str, row: Dict[str, Any], an: Optional[Dict[str, Any
         agents = an.get("agents") or {}
         if agents:
             lines += ["", "<b>Ajanlar</b>"] + [_agent_line(k, v, an.get("direction")) for k, v in agents.items() if v.get("ok")]
+        autonomous = ((an.get("regime") or {}).get("autonomous") or {})
+        extra = autonomous.get("agents") or {}
+        if extra:
+            lines += ["", "<b>AUTONOMOUS PRO — ek analiz (gölge, oy kullanmaz)</b>"]
+            for k, v in extra.items():
+                mark = ARROW.get(v.get("direction"), "▫️") if v.get("available") else "▫️"
+                lines.append(f"{mark} {esc(k)}: {esc(str(v.get('reason') or '-')[:66])}")
+            vp = m.get("volume_profile") or {}
+            if vp:
+                lines.append(f"VP tahmini: POC {num(vp.get('poc'))} · VAH {num(vp.get('vah'))} · VAL {num(vp.get('val'))}")
     lines += ["", "Zaman dilimleri (yapı / EMA trendi):"]
     for tf in TF_ORDER:
         v = (mtf.get("tfs") or {}).get(tf) or {}
