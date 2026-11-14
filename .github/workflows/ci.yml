@@ -69,7 +69,7 @@ jobs:
               echo 'TEST_FILES=tests/test_core.py tests/test_engine.py tests/test_exchange_data.py tests/test_execution_live.py tests/test_learning.py' >> "$GITHUB_ENV"
               ;;
             risk-gates-price-action)
-              echo 'TEST_FILES=tests/test_liquidation.py tests/test_live_gate.py tests/test_priceaction.py tests/test_radar.py tests/test_unified_features.py tests/test_v16_intelligence.py tests/test_v161_guards.py tests/test_radar_admission.py tests/test_v17_requested_daytrade.py' >> "$GITHUB_ENV"
+              echo 'TEST_FILES=tests/test_liquidation.py tests/test_live_gate.py tests/test_priceaction.py tests/test_radar.py tests/test_unified_features.py tests/test_v16_intelligence.py tests/test_v161_guards.py tests/test_radar_admission.py tests/test_v17_requested_daytrade.py tests/test_v17_autonomous_volume_profile.py tests/test_v17_autonomous_all_agents.py' >> "$GITHUB_ENV"
               ;;
             research-risk-reports)
               echo 'TEST_FILES=tests/test_reports.py tests/test_research_cli.py tests/test_risk.py' >> "$GITHUB_ENV"
