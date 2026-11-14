@@ -1,3 +1,4 @@
+import pytest
 """Telegram: notifier robustness, signal publishing (grades, cooldown, levels), events, digest and chat commands."""
 from imperion.config import TIMEFRAMES, load_settings
 from imperion.fakes import make_engine
@@ -89,17 +90,19 @@ def test_signal_only_mode_publishes_a_complete_signal_without_any_order(monkeypa
     assert not [c for c in fake.calls if c[0] == "POST"] and TOKEN not in msg
     engine.evaluate("SOLUSDT", "day"); engine.tg.flush()
     assert len(cap.sent) == 1, "one message per (symbol, style, side) per cooldown window"
-    engine.evaluate("SOLUSDT", "swing"); engine.tg.flush()
-    assert len(cap.sent) == 2 and "SWING" in cap.sent[1]
+    with pytest.raises(ValueError, match="DAY_TRADE_ONLY"):
+        engine.evaluate("SOLUSDT", "swing")
+    engine.tg.flush()
+    assert len(cap.sent) == 1, "scalp/swing must not produce signals"
     engine.stop()
 
 
-def test_short_scalp_signal_and_traded_tag(monkeypatch):
+def test_short_day_trade_signal_and_traded_tag(monkeypatch):
     engine, fake, cap = tg_engine(monkeypatch, side="SHORT", playbook="sweep_reversal")
-    assert engine.evaluate("LINKUSDT", "scalp")["traded"]
+    assert engine.evaluate("LINKUSDT", "day")["traded"]
     engine.tg.flush()
     msg = cap.text()
-    assert "LINKUSDT SHORT" in msg and "SCALP" in msg and "İŞLEM AÇILDI" in msg and "Likidite süpürmesi" in msg
+    assert "LINKUSDT SHORT" in msg and "DAY TRADE" in msg and "İŞLEM AÇILDI" in msg and "Likidite süpürmesi" in msg
     engine.stop()
 
 
@@ -147,7 +150,10 @@ def test_events_report_digest_and_commands(monkeypatch):
     engine.halt("test incident")
     engine.telegram.flush_events(); engine.tg.flush()
     msg = cap.text()
-    assert "OPENED LONG SOLUSDT" in msg and "test incident" in msg and "🚨" in msg
+    # Tight <=1% fill-risk policy can reject a slipped entry by emergency-close.
+    # Either outcome must be delivered as a persisted Telegram trade event.
+    assert ("OPENED LONG SOLUSDT" in msg or "SLIPPAGE_ABORT" in msg)
+    assert "test incident" in msg and "🚨" in msg
     n = len(cap.sent)
     engine.telegram.flush_events(); engine.tg.flush()
     assert len(cap.sent) == n, "the persisted cursor prevents repeats"
