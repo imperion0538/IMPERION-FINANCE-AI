@@ -14,6 +14,10 @@ from .sessions import find_sessions
 from .structure import MINOR_LEFT, MINOR_RIGHT, analyze_structure, dealing_range, find_swings
 from .types import Level, PAMap
 from .zones import find_mitigation_zones, find_zones, zone_quality
+from .volume_profile import (
+    build_volume_profile, build_session_profiles,
+    build_killzone_session_vp, order_block_vp_confluence,
+)
 
 
 
@@ -73,6 +77,36 @@ def build_map(candles: Sequence[Candle]) -> PAMap:
     for m in mitigation:
         m.quality = zone_quality(m)
         m.mean_threshold = (m.lo + m.hi) / 2.0
+
+    # Volume Profile from the SAME closed candles. This OHLCV-by-bin estimate is
+    # separate from V17's real AggTrade order flow; do not double-count it.
+    vp = build_volume_profile(cs, bins=36)
+    vp_sessions_raw = build_session_profiles(cs, bins=28) if vp else {}
+    vp_killzones_raw = build_killzone_session_vp(cs, bins=20) if vp else {}
+    vp_ob_raw = order_block_vp_confluence(
+        [z for z in zones if z.kind == "OB" and z.active], vp, price, a
+    ) if vp else []
+
+    def vp_levels(profile):
+        if profile is None:
+            return None
+        return {"poc": profile.poc, "vah": profile.vah, "val": profile.val,
+                "volume": round(profile.total_volume, 6),
+                "position": profile.current_position,
+                "hvn": profile.hvn_levels[:6], "lvn": profile.lvn_levels[:6],
+                "source": "OHLCV_uniform_bin_estimate"}
+
+    vp_info = vp_levels(vp) or {}
+    vp_sessions = {k: vp_levels(p) for k, p in vp_sessions_raw.items()}
+    vp_killzones = {k: vp_levels(p) for k, p in vp_killzones_raw.items()}
+    vp_ob = [{"direction": row["order_block"].direction,
+              "mid": round(row["order_block"].midpoint, 8),
+              "lo": row["order_block"].lo, "hi": row["order_block"].hi,
+              "base_quality": round(row["order_block"].quality, 3),
+              "vp_score": row["vp_score"], "reasons": row["reasons"],
+              "preferred": row["preferred"],
+              "distance_atr": round(abs(row["order_block"].midpoint - price) / a, 3)}
+             for row in vp_ob_raw[:10]]
 
     disp_facts = displacement_quality(cs, a)
     flow_div = candle_flow_divergence(cs)
@@ -167,6 +201,8 @@ def build_map(candles: Sequence[Candle]) -> PAMap:
         momentum=mom_dir, momentum_strength=round(mom_str, 3),
         trend_direction=trend_dir, trend_strength=round(trend_str, 3),
         sessions=sessions, cisds=cisds, displacement_quality=disp_facts["score"], displacement_facts=disp_facts, flow_divergence=flow_div,
+        volume_profile=vp_info, vp_sessions=vp_sessions, vp_killzones=vp_killzones,
+        vp_ob_confluence=vp_ob,
     )
 
 
@@ -199,6 +235,10 @@ def summary(m: PAMap) -> dict:
         "sessions": [{"name": s.name, "swept": s.swept, "dir": s.sweep_dir, "q": s.sweep_quality, "atr": s.range_atr, "killzone": s.killzone, "overlap": s.overlap} for s in m.sessions],
         "cisds": [{"dir": c.direction, "age": c.age, "q": c.quality, "ft": c.follow_through, "after_sw": c.after_sweep, "after_sess": c.after_session} for c in m.cisds],
 
+        "volume_profile": dict(m.volume_profile),
+        "vp_sessions": dict(m.vp_sessions),
+        "vp_killzones": dict(m.vp_killzones),
+        "vp_ob_confluence": [dict(row) for row in m.vp_ob_confluence[:6]],
         "candle": m.candle.patterns, "displacement": m.displacement,
     }
 
