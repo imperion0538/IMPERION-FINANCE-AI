@@ -1,3 +1,4 @@
+
 """Tiered radar: tier-1 scoring of every candidate, tier-2 Director analysis of the best few, never traded."""
 import pytest
 
@@ -61,7 +62,7 @@ def test_scan_signals_are_marked_scan_only(monkeypatch):
     monkeypatch.setattr(engine.director, "analyze", lambda sym, style, *a, **k: approved(sym, style))
     out = engine.radar_scan()
     engine.tg.flush()
-    assert out["deep"] and cap.sent and all("TARAMA LİSTESİ" in m for m in cap.sent)
+    assert out["deep"] and cap.sent and all("RADAR ÖN ANALİZİ" in m for m in cap.sent)
     n = len(cap.sent)
     engine.radar_scan(); engine.tg.flush()
     assert len(cap.sent) == n, "scan signals have their own cooldown"
