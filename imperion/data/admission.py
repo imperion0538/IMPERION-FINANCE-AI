@@ -1,6 +1,6 @@
 """Temporary Radar symbol permissions. No orders and no changes to risk limits.
 
-Operator allowlist + current eligible Radar row + approved deep analysis +
+Optional narrowing allowlist + current eligible Radar row + A+/A deep analysis +
 healthy data + current exchange filters are all required. Leases are never
 restored from disk: restart requires fresh analysis and admission again.
 """
@@ -51,8 +51,8 @@ class RadarAdmission:
             f = filters.get(symbol)
             if not self.cfg.radar_trading_enabled:
                 reason = 'RADAR_TRADING_DISABLED'
-            elif symbol not in self.cfg.radar_trade_allowlist:
-                reason = 'OPERATOR_APPROVAL_REQUIRED'
+            elif self.cfg.radar_trade_allowlist and symbol not in self.cfg.radar_trade_allowlist:
+                reason = 'OPTIONAL_RADAR_ALLOWLIST_RESTRICTION'
             elif symbol in self.cfg.symbols:
                 continue
             elif row.get('eligible') is not True or not finite(row.get('score')) or not 0 <= row['score'] <= 1:
@@ -61,7 +61,7 @@ class RadarAdmission:
                 reason = 'RADAR_LOW_LIQUIDITY'
             elif not fresh(radar_updated, now, ttl) or not fresh(analysis.get('ts'), now, ttl):
                 reason = 'RADAR_EVIDENCE_STALE'
-            elif analysis.get('approved') is not True or analysis.get('direction') not in ('LONG', 'SHORT') or not analysis.get('setup'):
+            elif analysis.get('approved') is not True or analysis.get('grade') not in ('A+', 'A') or analysis.get('direction') not in ('LONG', 'SHORT') or not analysis.get('setup'):
                 reason = 'DEEP_ANALYSIS_NOT_APPROVED'
             elif not fresh(filters_updated, now, FILTER_MAX_AGE_MS):
                 reason = 'EXCHANGE_FILTERS_STALE'
@@ -78,7 +78,7 @@ class RadarAdmission:
                     'admitted_ms': now,
                     'expires_ms': min(now + ttl, radar_updated + ttl,
                                       analysis['ts'] + ttl, filters_updated + FILTER_MAX_AGE_MS),
-                    'style': 'day', 'source': 'operator_allowlist_and_radar',
+                    'style': 'day', 'source': 'automatic_a_plus_or_a_radar',
                 }
         with self._lock:
             self._leases, self._rejections = leases, rejected
