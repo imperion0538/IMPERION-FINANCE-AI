@@ -1213,6 +1213,25 @@ def find_playbooks(
                 "+ likidite sweep teyidi"
             )
 
+        # AUTONOMOUS PRO OB + Volume Profile: bounded confirmation only.
+        # The source VP approximates volume by distributing candle volume across
+        # price bins. It cannot grant a trade on its own, change its stop, or
+        # override V17 agent consensus, A+/A gating, Guardian, or risk engine.
+        vp_candidates = [
+            row for row in setup.vp_ob_confluence
+            if row.get("direction") == d
+            and row.get("preferred") is True
+            and row.get("distance_atr", float("inf")) <= 1.5
+        ]
+        if vp_candidates:
+            best_vp = max(vp_candidates, key=lambda item: item["vp_score"])
+            score += 0.04
+            playbook.steps.append(
+                "OB+Volume Profile teyidi "
+                f"(VP={best_vp['vp_score']:.2f}, "
+                f"kanıt={','.join(best_vp['reasons'])}, OHLCV tahmini; +0.04)"
+            )
+
         if not _finite(score):
             continue
 
