@@ -25,6 +25,8 @@ import math
 from typing import Callable, Dict, Optional, Sequence, Tuple
 
 from ..agents import AgentContext, default_team
+from ..agents.autonomous import AutonomousIntelligence
+from ..learning.autonomous import AutonomousMind
 from ..analysis import market
 from ..analysis.mtf import alignment, mtf_view
 from ..analysis.priceaction import build_map, summary
@@ -120,6 +122,9 @@ class Director:
             if agents is not None
             else default_team()
         )
+
+        self.autonomous_intelligence = AutonomousIntelligence()
+        self.autonomous_mind = AutonomousMind()
 
         self.weights_provider = (
             weights_provider
@@ -390,6 +395,17 @@ class Director:
             },
             data_ok=data_ok,
         )
+
+        # AUTONOMOUS PRO 1.5 RL supplementary team: evidence-only and independent
+        # of legacy eleven-agent consensus and all execution/risk gates.
+        # Errors are explicitly unavailable, never positive evidence.
+        try:
+            autonomous = self.autonomous_intelligence.analyze(ctx)
+            autonomous["thought"] = self.autonomous_mind.think(autonomous)
+            an.regime["autonomous"] = autonomous
+        except Exception as exc:
+            an.regime["autonomous"] = {"mode": "shadow_only", "available": 0,
+                                        "reason": f"agent adapter: {type(exc).__name__}"}
 
         # Fail-closed default:
         # A rejected candidate is never an approved trade.
