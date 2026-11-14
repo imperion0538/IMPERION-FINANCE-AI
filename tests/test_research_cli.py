@@ -158,10 +158,11 @@ def test_dashboard_page_is_public_static_and_secret_free():
 
 
 def test_settings_universe_rules():
+    """V17 fixed 11 + dynamic radar 10; reject invalid universe config."""
     s = load_settings({})
-    assert len(s.symbols) == 16 and s.radar_count == 30 and s.mode == "dry" and not s.orders_possible
+    assert len(s.symbols) == 11 and s.radar_count == 10 and s.mode == "dry" and not s.orders_possible
     assert len(load_settings({"SYMBOLS": "BTCUSDT,ETHUSDT"}).symbols) == 2, "the execution universe is configurable"
-    for bad in ({"SYMBOLS": "BTCUSDT,BTCUSDT"}, {"SYMBOLS": ",".join(f"S{i}USDT" for i in range(41))}, {"RADAR_COUNT": "31"},
+    for bad in ({"SYMBOLS": "BTCUSDT,BTCUSDT"}, {"SYMBOLS": ",".join(f"S{i}USDT" for i in range(65))}, {"RADAR_COUNT": "31"},
                 {"TELEGRAM_MIN_GRADE": "C"}, {"ACTIVE_STYLES": ""}, {"SYMBOLS": "BTC-USD"}):
         with pytest.raises(ValueError):
             load_settings(bad)
