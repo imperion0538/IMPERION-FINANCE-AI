@@ -12,7 +12,7 @@ from imperion.fakes import make_engine, warm_feed
 from imperion.util import now_ms
 from .helpers import crafted_analyze
 
-ENV = {'RADAR_TRADING_ENABLED':'true','RADAR_TRADE_ALLOWLIST':'HYPEUSDT,INJUSDT,FILUSDT',
+ENV = {'RADAR_TRADING_ENABLED':'true','RADAR_TRADE_ALLOWLIST':'HYPEUSDT,BNBUSDT,ADAUSDT',
        'RADAR_DEEP_COUNT':'3','RADAR_MIN_QUOTE_VOLUME':'1'}
 
 
@@ -41,7 +41,7 @@ def test_default_stays_scan_only():
 @pytest.mark.parametrize('changes',[{'RADAR_COUNT':'0'},
     {'RADAR_DEEP_COUNT':'0'},{'ACTIVE_STYLES':'scalp'}, {'RADAR_MAX_ACTIVE':'1.5'},
     {'RADAR_ADMISSION_TTL_SECONDS':'nan'},{'RADAR_MIN_QUOTE_VOLUME':'nan'},
-    {'RADAR_TRADE_ALLOWLIST':'BTC/USDT'},{'RADAR_TRADE_ALLOWLIST':'INJUSDT,INJUSDT'}])
+    {'RADAR_TRADE_ALLOWLIST':'BTC/USDT'},{'RADAR_TRADE_ALLOWLIST':'BNBUSDT,BNBUSDT'}])
 def test_bad_configuration_rejected(changes):
     with pytest.raises(ValueError):load_settings({**ENV,**changes})
 
@@ -74,16 +74,16 @@ def test_each_required_gate_can_block(condition):
 
 def test_active_symbol_limit_and_revocation():
     cfg,now,r,d,f=fixture_data(RADAR_MAX_ACTIVE='1')
-    r.append(dict(r[0],symbol='INJUSDT'));d['INJUSDT']=dict(d['HYPEUSDT']);f['INJUSDT']=f['HYPEUSDT']
+    r.append(dict(r[0],symbol='BNBUSDT'));d['BNBUSDT']=dict(d['HYPEUSDT']);f['BNBUSDT']=f['HYPEUSDT']
     manager=RadarAdmission(cfg);admit(manager,now,r,d,f)
     assert manager.symbols(now)==['HYPEUSDT']
-    manager.revoke_missing(['INJUSDT'])
+    manager.revoke_missing(['BNBUSDT'])
     assert manager.symbols(now)==[]
 
 
 @pytest.fixture
 def prepared(monkeypatch):
-    engine,fake=make_engine(env={**ENV,"RADAR_TRADE_ALLOWLIST":"INJUSDT"})
+    engine,fake=make_engine(env={**ENV,"RADAR_TRADE_ALLOWLIST":"BNBUSDT"})
     warm_feed(fake,engine.trades,engine.books,symbols=list(engine.radar.symbols()))
     monkeypatch.setattr(engine.director,'analyze',crafted_analyze(fake))
     scan=engine.radar_scan()
@@ -184,7 +184,7 @@ def test_status_exposes_permissions_without_changing_fixed_list(prepared):
 
 
 def test_exchange_minimum_cannot_force_extra_risk(monkeypatch):
-    e,f=make_engine(env={**ENV,'RADAR_TRADE_ALLOWLIST':'HYPEUSDT','RISK_PER_TRADE_PCT':'0.1'})
+    e,f=make_engine(env={**ENV,'RADAR_TRADE_ALLOWLIST':'HYPEUSDT','RADAR_COUNT':'10','RADAR_DEEP_COUNT':'10','RISK_PER_TRADE_PCT':'0.1'})
     warm_feed(f,e.trades,e.books,symbols=e.radar.symbols())
     monkeypatch.setattr(e.director,'analyze',crafted_analyze(f))
     assert 'HYPEUSDT' in e.radar_scan()['admission']['active']
@@ -203,16 +203,16 @@ def test_existing_risk_position_limit_applies_to_admitted_symbol(prepared):
 def test_restart_retains_owned_position_but_does_not_restore_entry_permission(monkeypatch,tmp_path):
     from imperion.db import Database
     path=str(tmp_path/'state.db')
-    e,f=make_engine(env={**ENV,'RADAR_TRADE_ALLOWLIST':'INJUSDT'},db=Database(path))
+    e,f=make_engine(env={**ENV,'RADAR_TRADE_ALLOWLIST':'BNBUSDT'},db=Database(path))
     warm_feed(f,e.trades,e.books,symbols=e.radar.symbols())
     monkeypatch.setattr(e.director,'analyze',crafted_analyze(f))
-    assert 'INJUSDT' in e.radar_scan()['admission']['active']
-    assert e.evaluate('INJUSDT','day')['traded']
+    assert 'BNBUSDT' in e.radar_scan()['admission']['active']
+    assert e.evaluate('BNBUSDT','day')['traded']
     e.stop()
     e2,_=make_engine(fake=f,env={'RADAR_COUNT':'0','RADAR_TRADING_ENABLED':'false'},db=Database(path))
-    assert 'INJUSDT' not in e2.execution_symbols()
-    assert 'INJUSDT' in e2._stream_symbols() and 'INJUSDT' in e2.poller.symbols
-    assert e2.db.open_trades() and 'INJUSDT' in f.pos
+    assert 'BNBUSDT' not in e2.execution_symbols()
+    assert 'BNBUSDT' in e2._stream_symbols() and 'BNBUSDT' in e2.poller.symbols
+    assert e2.db.open_trades() and 'BNBUSDT' in f.pos
 
 
 def test_trade_loop_evaluates_admitted_symbols_only_for_day(prepared,monkeypatch):
