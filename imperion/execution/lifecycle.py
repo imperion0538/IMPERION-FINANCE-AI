@@ -28,7 +28,7 @@ from .base import ExecutionError, Executor
 log = logging.getLogger("imperion.lifecycle")
 
 BE_FEE_BUFFER = 0.0012      # stop moved to entry +/- 0.12% (covers round-trip fees)
-MAX_SLIPPAGE_RISK_MULT = 1.6
+MAX_SLIPPAGE_RISK_MULT = 1.0  # never intentionally retain an entry above the approved planned risk
 ROUTINE_CLOSE_REASONS = {"TIME_STOP", "ADMIN_FLATTEN"}
 EXPOSURE_HALT_AFTER_S = 60.0   # positions unreadable for this long -> halt (until then entries are only blocked)
 PENDING_GRACE_MS = 30_000
@@ -116,9 +116,10 @@ class Lifecycle:
         meta_d = dict(t.get("meta") or {})
         meta_d["fill_status"] = fill.status
         risk_actual = abs(entry - setup.stop) * float(fill.qty)
+        actual_with_fees = risk_actual + entry * float(fill.qty) * 2 * self.cfg.taker_fee_pct / 100
         # ts_open stays the moment BEFORE the entry order: the entry fill (and its fee) must fall inside the PnL window
         self.db.upsert_trade({"id": tid, "entry": entry, "qty": float(fill.qty), "status": "OPEN",
-                              "risk_usdt": max(risk_actual, 1e-9), "meta": meta_d})
+                              "risk_usdt": max(actual_with_fees, 1e-9), "meta": meta_d})
 
         # 1) protective stop (mandatory)
         if not self._ensure_stop(sym, side, setup.stop, fill.qty, tid):
@@ -140,8 +141,8 @@ class Lifecycle:
             return self.db.get_trade(tid)
 
         # slippage sanity: if the realised risk blew through the plan, do not keep the trade
-        if sizing["planned_risk_usdt"] > 0 and risk_actual > sizing["planned_risk_usdt"] * MAX_SLIPPAGE_RISK_MULT:
-            self.db.event("WARNING", "slippage_abort", f"{sym}: realised risk {risk_actual:.2f} > {MAX_SLIPPAGE_RISK_MULT}x plan; closing")
+        if sizing["planned_risk_usdt"] > 0 and actual_with_fees > sizing["planned_risk_usdt"] * MAX_SLIPPAGE_RISK_MULT + 1e-9:
+            self.db.event("WARNING", "slippage_abort", f"{sym}: realised risk including fees {actual_with_fees:.2f} > {MAX_SLIPPAGE_RISK_MULT}x plan; closing")
             self._emergency_close(sym, side, fill.qty, tid, "SLIPPAGE_ABORT")
             return self.db.get_trade(tid)
 
@@ -159,9 +160,9 @@ class Lifecycle:
         except Exception as exc:
             self.db.event("ERROR", "tp_failed", f"{sym}: take-profit placement failed: {exc}")
         try:
-            self.risk.register_new_risk(risk_actual, self.risk.trading_equity(self.exec.account().equity))
+            self.risk.register_new_risk(actual_with_fees, self.risk.trading_equity(self.exec.account().equity))
         except Exception:
-            self.risk.register_new_risk(risk_actual, self.cfg.trading_capital_usdt)
+            self.risk.register_new_risk(actual_with_fees, self.cfg.trading_capital_usdt)
         self.db.event("INFO", "trade_open", f"{side} {sym} qty={fill.qty} entry={entry} stop={setup.stop} tp1={setup.tp1} tp2={setup.tp2}", {"id": tid})
         self.alert("INFO", f"OPENED {side} {sym} @ {entry} stop {setup.stop} tp {setup.tp2} risk {risk_actual:.2f} USDT")
         return self.db.get_trade(tid)
@@ -276,8 +277,9 @@ class Lifecycle:
             pos = positions.get(t["symbol"])
             if pos is not None and pos.side == t["side"]:
                 risk_actual = abs(float(pos.entry) - float(t["stop"])) * abs(float(pos.qty))
+                risk_with_fees = risk_actual + float(pos.entry) * abs(float(pos.qty)) * 2 * self.cfg.taker_fee_pct / 100
                 self.db.upsert_trade({"id": t["id"], "status": "OPEN", "entry": pos.entry, "qty": abs(pos.qty), "exit_reason": None,
-                                      "risk_usdt": max(risk_actual, 1e-9)})
+                                      "risk_usdt": max(risk_with_fees, 1e-9)})
                 self.db.event("WARNING", "adopted_pending", f"{t['symbol']}: unresolved entry ({t['status']}) found on exchange, adopted; guardian will verify its stop")
             else:
                 self.db.upsert_trade({"id": t["id"], "status": "FAILED", "ts_close": now_ms(),
