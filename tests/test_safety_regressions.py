@@ -76,7 +76,8 @@ def test_failed_entry_keeps_trade_meta():
 
 # ---- risk baseline -------------------------------------------------------------------------------------
 def test_resume_after_drawdown_does_not_rehalt_when_wallet_exceeds_allocation():
-    bot, fake = make_engine()
+    # Optional drawdown policy is OFF by default for Day Trade.
+    bot, fake = make_engine(env={"MAX_DRAWDOWN_PCT": "5", "DAILY_LOSS_LIMIT_PCT": "0"})
     risk = bot.risk
     risk.update_equity(1000.0)                             # wallet 1000, allocation 100
     assert "drawdown" in (risk.update_equity(980.0) or "")  # -20 USDT = -20% of the allocation
@@ -87,7 +88,7 @@ def test_resume_after_drawdown_does_not_rehalt_when_wallet_exceeds_allocation():
 
 
 def test_cli_style_resume_without_equity_rebaselines_on_next_update():
-    bot, fake = make_engine()
+    bot, fake = make_engine(env={"MAX_DRAWDOWN_PCT": "5", "DAILY_LOSS_LIMIT_PCT": "0"})
     risk = bot.risk
     risk.update_equity(100.0)
     assert risk.update_equity(80.0)
