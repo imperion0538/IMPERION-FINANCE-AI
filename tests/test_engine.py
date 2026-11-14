@@ -60,8 +60,8 @@ def test_full_approved_path_places_entry_stop_and_targets(rig):
         and trade["mode"] == "live"
     )
 
-    # Conservative 0.25% default risk.
-    assert 0.15 <= trade["risk_usdt"] <= 0.30
+    # Requested <=1% risk.
+    assert 0.0 < trade["risk_usdt"] <= 1.0
 
     kinds = sorted(
         (order["orderType"], order["closePosition"])
@@ -267,7 +267,7 @@ def test_short_side_and_tradingview_hint(monkeypatch):
 
     result = engine.evaluate(
         "LINKUSDT",
-        "swing",
+        "day",
         hint="SHORT",
         source="tradingview",
     )
@@ -377,6 +377,7 @@ def test_decision_pass_runs_each_series_once_per_candle(
         hint=None,
         source="loop",
         now=None,
+        prepared=None,
     ):
         assert now == clock["now"]
         calls.append((symbol, style))
@@ -426,28 +427,9 @@ def test_decision_pass_runs_each_series_once_per_candle(
         assert engine.decision_pass() == 0
         assert calls == []
 
-        # Only this symbol receives a new closed 1m candle.
-        rows = engine.rest.klines(
-            "SOLUSDT",
-            "1m",
-            limit=3,
-        )
-
-        added = engine.candles.ingest(
-            "SOLUSDT",
-            "1m",
-            rows,
-            now=clock["now"],
-        )
-
-        assert added == 1
-        assert engine.decision_pass() == 1
-        assert calls == [("SOLUSDT", "scalp")]
-
-        assert engine.decision_pass() == 0
-        assert calls == [("SOLUSDT", "scalp")]
-
-        # The day-style trigger is independent of scalp.
+        # Only the 5m Day Trade trigger is active, never the 1m scalp trigger.
+        assert engine.cfg.active_styles == ("day",)
+        # Advance to the next 5m closed candle.
         clock["now"] = (
             clock["now"] // 300_000 + 1
         ) * 300_000 + 1
