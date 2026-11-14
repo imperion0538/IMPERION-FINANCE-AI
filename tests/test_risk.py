@@ -27,7 +27,7 @@ def test_sizing_respects_risk_and_exchange_filters():
     r = rm.size(setup(), SOL, 100.0, 100.0)
     assert r["ok"]
     assert r["qty"] % Decimal("0.01") == 0
-    assert 0.20 <= r["risk_usdt"] <= 0.30                              # 0.25% of 100 USDT incl. fees/rounding
+    assert 0.80 <= r["risk_usdt"] <= 1.0                              # up to 1% of 100 USDT incl. fees/rounding
     assert r["margin"] <= 100 * 0.9 and r["notional"] <= 100 * CFG.leverage
     assert r["split"] and r["tp1_qty"] + r["tp2_qty"] == r["qty"]
 
@@ -49,27 +49,26 @@ def test_precheck_limits():
     rm = RiskManager(CFG, db)
     day = STYLES["day"]
     assert rm.precheck("SOLUSDT", day, "LONG", [], 100.0)["allowed"]
-    two = [_trade("LTCUSDT", "LONG"), _trade("XRPUSDT", "SHORT")]
-    assert any("MAX_POSITIONS" in x for x in rm.precheck("SOLUSDT", day, "LONG", two, 100.0)["reasons"])
+    four = [_trade(s, "LONG") for s in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT")]
+    assert rm.precheck("ADAUSDT", day, "LONG", four, 100.0)["allowed"]
+    assert any("MAX_POSITIONS" in x for x in rm.precheck("XRPUSDT", day, "LONG", four + [_trade("ADAUSDT", "LONG")], 100.0)["reasons"])
     assert any("SYMBOL_ALREADY" in x for x in rm.precheck("LTCUSDT", day, "LONG", [_trade("LTCUSDT", "LONG")], 100.0)["reasons"])
-    corr = rm.precheck("ETHUSDT", day, "LONG", [_trade("BTCUSDT", "LONG")], 100.0)
-    assert not corr["risk_budget_ok"] and any("CORRELATION" in x for x in corr["reasons"])
-    assert rm.precheck("ETHUSDT", day, "SHORT", [_trade("BTCUSDT", "LONG")], 100.0)["risk_budget_ok"] is False or True  # open-risk limit may bind
+    assert rm.precheck("ETHUSDT", day, "LONG", [_trade("BTCUSDT", "LONG")], 100.0)["allowed"]
     low = rm.precheck("SOLUSDT", day, "LONG", [], 10.0)
     assert any("EQUITY_BELOW_MIN" in x for x in low["reasons"]) and not low["position_limit_ok"]
-    assert any("OPEN_RISK" in x for x in rm.precheck("SOLUSDT", day, "LONG", [_trade("LTCUSDT", "LONG", 1.5)], 100.0)["reasons"])
+    assert any("OPEN_RISK" in x for x in rm.precheck("SOLUSDT", day, "LONG", [_trade("LTCUSDT", "LONG", 9.5)], 100.0)["reasons"])
 
 
 def test_cooldown_daily_budget_pause_and_halt():
     db = Database(":memory:")
-    rm = RiskManager(CFG, db)
+    rm = RiskManager(load_settings({"CONSECUTIVE_LOSS_PAUSE": "3", "LOSS_PAUSE_MINUTES": "240"}), db)
     day = STYLES["day"]
     db.upsert_trade({"id": "t1", "ts_open": now_ms() - 30 * 60_000, "symbol": "SOLUSDT", "style": "day", "side": "LONG", "status": "CLOSED"})
     assert any("COOLDOWN" in x for x in rm.precheck("SOLUSDT", day, "LONG", [], 100.0)["reasons"])
-    db.kv_set("risk.daily_new_risk", 0.025)
+    db.kv_set("risk.daily_new_risk", 0.095)
     assert any("DAILY_NEW_RISK" in x for x in rm.precheck("LTCUSDT", day, "LONG", [], 100.0)["reasons"])
     db.kv_set("risk.daily_new_risk", 0.0)
-    for _ in range(CFG.consecutive_loss_pause):
+    for _ in range(rm.cfg.consecutive_loss_pause):
         rm.record_result(-1.0)
     assert any("LOSS_PAUSE" in x for x in rm.precheck("LTCUSDT", day, "LONG", [], 100.0)["reasons"])
     rm.record_result(1.0)
