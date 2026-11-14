@@ -113,7 +113,7 @@ def render(data: Dict[str, Any]) -> Tuple[str, str, str]:
         L.append(f"  {sym:9} fiyat {s.get('price', '-')} | MTF {s.get('mtf', '-')} | rejim {s.get('regime', '-')} | son karar {s.get('direction', '-')} {s.get('grade', '')} {s.get('playbook') or ''} | balina 15dk {_fmt(s.get('whale_net_15m'), 0, True)} USDT | defter {_fmt(s.get('book_imbalance'), 2, True)} | funding {_fmt(s.get('funding_pct'), 3, True)}%")
     L.append("")
     if data["radar"]:
-        L.append("TARAMA LİSTESİ (yalnızca izleme, işlem yok)")
+        L.append("TARAMA LİSTESİ (radar ön tarama; A+/A derin analiz ve kabul sonrası işlem adayı)")
         for r in data["radar"]:
             L.append(f"  {r['symbol']:12} 24s hacim {_fmt(r.get('quote_volume', 0) / 1e6, 0)}M USDT | 1s {r.get('bias_1h', '-')} | balina 15dk {_fmt(r.get('whale_net_15m'), 0, True)} USDT")
         L.append("")
@@ -130,6 +130,13 @@ def render(data: Dict[str, Any]) -> Tuple[str, str, str]:
           "  Kazanma olasılığı modeli: " + ("yok (yeterli veri bekleniyor)" if not ai.get("win_model") else
                                              ("doğrulandı" if ai["win_model"].get("validated") else "yalnızca danışma") +
                                              f" (AUC {(ai['win_model'].get('metrics') or {}).get('auc', '-')}, Brier {(ai['win_model'].get('metrics') or {}).get('brier', '-')})"), ""]
+    autonomous = ai.get("autonomous") or {}
+    if autonomous:
+        mind = autonomous.get("mind") or {}
+        L.append("AUTONOMOUS PRO (yalnızca gölge araştırma; risk/oy etkisi yok)")
+        L.append(f"  Çözülmüş deneyim: {autonomous.get('experience_count', 0)} | beklenti: {_fmt(mind.get('expectancy_r'), 3, True)}R")
+        L.append("  Otonom ağırlık/risk değiştirme: KAPALI | manuel onay zorunlu")
+        L.append("")
     perf = (ai.get("performance") or {})
     if perf:
         L.append("PERFORMANS SINIFLARI (ayrı ölçülür, asla birleştirilmez)")
