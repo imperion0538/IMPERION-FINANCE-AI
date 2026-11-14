@@ -684,7 +684,7 @@ def test_maintenance_snapshot_status_and_secrets(rig):
 
     assert (
         set(snapshot["symbols"])
-        == set(engine.cfg.symbols)
+        == set(engine.execution_symbols())
         and snapshot["radar"]
         and snapshot["radar"][0]["bias_1h"]
     )
