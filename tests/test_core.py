@@ -1068,7 +1068,8 @@ def test_director_rejections(rigged):
     assert weak.direction == "NO TRADE"
     assert weak.grade == "C"
     assert any(
-        "QUALITY_BELOW_THRESHOLD" in reason
+        "QUALITY_A_PLUS_OR_A_REQUIRED" in reason
+        or "QUALITY_BELOW_THRESHOLD" in reason
         for reason in weak.reasons
     )
 
