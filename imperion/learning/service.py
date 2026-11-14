@@ -13,6 +13,7 @@ from ..config import Settings
 from ..db import Database
 from ..models import Analysis
 from . import model as win_model
+from .autonomous import ExperienceMemory, AutonomousMind, research_summary
 from .context import ContextStats
 from .controlled import validate_learning
 from .learner import WeightLearner
@@ -28,6 +29,7 @@ class LearningService:
         self.learner = WeightLearner(db, cfg, shadows)
         self.model: Optional[win_model.WinModel] = win_model.WinModel.from_dict(db.kv_get("ai.model"))
         self._ctx: Tuple[float, Optional[ContextStats]] = (0.0, None)
+        self._autonomous_memory: Tuple[float, Optional[ExperienceMemory]] = (0.0, None)
 
     @property
     def min_context_samples(self) -> int:
@@ -44,6 +46,14 @@ class LearningService:
             stats = ContextStats(self._approved(self.shadows.resolved()))
             self._ctx = (time.time(), stats)
         return stats
+
+    def experience_memory(self) -> ExperienceMemory:
+        """Cache the history reader: decisions must never re-scan full DB."""
+        stamp, memory = self._autonomous_memory
+        if memory is None or time.time() - stamp >= CONTEXT_REFRESH_S:
+            memory = ExperienceMemory(self.shadows.resolved())
+            self._autonomous_memory = (time.time(), memory)
+        return memory
 
     def opinion(self, an: Analysis) -> Dict[str, Any]:
         out: Dict[str, Any] = {"blocked": False, "reasons": [], "p_win": None, "model_validated": False, "contexts": []}
@@ -63,6 +73,17 @@ class LearningService:
                     out["reasons"].append(f"AI_LOW_WIN_PROBABILITY (p={p:.2f} < {self.cfg.ai_min_win_prob:.2f})")
         except Exception as exc:          # the AI layer is optional: a failure never breaks the decision path
             log.warning("AI opinion failed: %s: %s", type(exc).__name__, exc)
+        # Additional historical context is descriptive ONLY. No extra veto,
+        # no new trades, no learned weight or risk changes.
+        try:
+            if an.direction in ("LONG", "SHORT"):
+                memory = self.experience_memory()
+                ctx = {"regime":an.regime.get("regime"), "session":an.regime.get("session"),
+                       "grade":an.grade, "playbook":an.playbook.name if an.playbook else None}
+                out["autonomous_experience"] = memory.verdict(ctx,an.symbol)
+        except Exception as exc:
+            log.debug("autonomous memory unavailable: %s", type(exc).__name__)
+            out["autonomous_experience"] = {"samples":0,"reliable":False}
         out["blocked"] = bool(out["reasons"])
         return out
 
@@ -80,6 +101,10 @@ class LearningService:
         rep["win_model"] = model_rep
         stats = ContextStats(self._approved(samples))
         self._ctx = (time.time(), stats)
+        # Never auto-approve learned weights or change the Guardian policy.
+        rep["autonomous"] = research_summary(samples)
+        self.db.kv_set("autonomous.last_report", rep["autonomous"])
+        self._autonomous_memory = (time.time(), ExperienceMemory(samples))
         rep["contexts"] = {"worst": stats.worst(self.min_context_samples), "best": stats.best(self.min_context_samples),
                            "filter": "on" if self.cfg.ai_context_filter else "off", "veto": "on" if self.cfg.ai_veto else "off"}
         self.db.kv_set("ai.last_report", rep)
@@ -89,4 +114,5 @@ class LearningService:
         out = self.learner.summary()
         out["win_model"] = self.model.to_dict() if self.model else None
         out.update(context_filter=self.cfg.ai_context_filter, veto=self.cfg.ai_veto, min_win_prob=self.cfg.ai_min_win_prob)
+        out["autonomous"] = self.db.kv_get("autonomous.last_report") or research_summary([])
         return out
